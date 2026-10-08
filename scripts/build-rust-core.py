@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the pinned Rust core with the documented geodata budget patch."""
+"""Build the pinned, unmodified Rust core for the Android Rust build."""
 import hashlib
 import json
 import os
@@ -10,10 +10,10 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / '.native/xray-rust'
-COMMIT = 'ed5258a3a589c2a1f9330142f37c8f3d28a640fa'
+VERSION = '0.7.0'
+COMMIT = '67969094b352f948c6b8b9e2ac75402c577cb7f7'
 TOOLCHAIN = '1.96.0'
 NDK_VERSION = '28.2.13676358'
-PATCH = ROOT / 'third_party/xray-rust/geo-budgets.patch'
 STAMP = ROOT / '.native/rust-build.json'
 DEST = ROOT / 'android/xraymobile/src/main/jniLibs'
 TARGETS = {'aarch64-linux-android': 'arm64-v8a', 'x86_64-linux-android': 'x86_64'}
@@ -24,15 +24,14 @@ def run(args, **kwargs):
 
 
 def main():
-    identity = dict(commit=COMMIT, toolchain=TOOLCHAIN, ndk=NDK_VERSION,
-                    patch=hashlib.sha256(PATCH.read_bytes()).hexdigest())
+    identity = dict(commit=COMMIT, toolchain=TOOLCHAIN, ndk=NDK_VERSION)
     if STAMP.exists():
         saved = json.loads(STAMP.read_text())
         if saved.get('identity') == identity and all(
                 (DEST / abi / 'libxray_ffi.so').is_file() and
                 hashlib.sha256((DEST / abi / 'libxray_ffi.so').read_bytes()).hexdigest() == saved.get('sha256', {}).get(abi)
                 for abi in TARGETS.values()):
-            print('xray-rust 0.6.1+geo.1: verified cached native binaries', flush=True)
+            print(f'xray-rust {VERSION}: verified cached native binaries', flush=True)
             return
     if not shutil.which('rustup'):
         raise RuntimeError('Install rustup to build xray-rust (Rust 1.96.0).')
@@ -51,10 +50,9 @@ def main():
     actual = subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip()
     if actual != COMMIT:
         raise RuntimeError('Native source revision differs from the pinned commit.')
-    applied = subprocess.run(['git', '-C', str(SOURCE), 'apply', '--reverse', '--check', str(PATCH)], capture_output=True).returncode == 0
-    if not applied:
-        run(['git', '-C', str(SOURCE), 'apply', '--check', str(PATCH)])
-        run(['git', '-C', str(SOURCE), 'apply', str(PATCH)])
+    # v0.7.0 includes the GeoIP budgets that earlier builds patched locally.
+    if subprocess.check_output(['git', '-C', str(SOURCE), 'status', '--porcelain'], text=True).strip():
+        raise RuntimeError('Native source checkout has local changes; the Rust core is built unmodified.')
     run(['rustup', 'toolchain', 'install', TOOLCHAIN, '--profile', 'minimal', '--no-self-update'])
     run(['rustup', 'target', 'add', '--toolchain', TOOLCHAIN, *TARGETS])
     env = os.environ.copy()
@@ -80,7 +78,7 @@ def main():
         temporary.replace(destination)
         hashes[abi] = hashlib.sha256(data).hexdigest()
     STAMP.write_text(json.dumps(dict(identity=identity, sha256=hashes), indent=2))
-    print('xray-rust 0.6.1+geo.1: built both Android architectures', flush=True)
+    print(f'xray-rust {VERSION}: built both Android architectures', flush=True)
 
 
 if __name__ == '__main__':

@@ -15,7 +15,7 @@ import java.util.concurrent.TimeUnit
 
 /** Owns one Rust runtime. Android owns the borrowed TUN descriptor. */
 internal object RustCore {
-    const val VERSION = "xray-rust 0.6.1+geo.1"
+    const val VERSION = "xray-rust 0.7.0"
     private var core: XrayCore? = null
     private var lastRxPackets = 0L
     private var lastRxAt = 0L
