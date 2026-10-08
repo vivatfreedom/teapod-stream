@@ -1,3 +1,5 @@
+import '../models/heartbeat_settings.dart';
+
 /// The same TEAPOD_CORE build flag selects native sources in Android Gradle.
 enum CoreFeature {
   socksAuthentication,
@@ -18,6 +20,10 @@ enum CoreFeature {
   geoip,
   geosite,
   appRouting,
+  coreDelayProbe,
+  passiveHeartbeat,
+  tetheringControl,
+  outboundDelayProbe,
 }
 
 class CoreFeatures {
@@ -48,6 +54,10 @@ class CoreFeatures {
     CoreFeature.observatory,
     CoreFeature.rawConfig,
     CoreFeature.visionWithTls,
+    CoreFeature.coreDelayProbe,
+    CoreFeature.passiveHeartbeat,
+    CoreFeature.tetheringControl,
+    CoreFeature.outboundDelayProbe,
   };
   bool supports(CoreFeature feature) =>
       !isRust || !rustDisabled.contains(feature);
@@ -56,6 +66,28 @@ class CoreFeatures {
     required bool requested,
     required bool usesVision,
   }) => requested || (supports(CoreFeature.quicBlocking) && usesVision);
+
+  /// The feature a heartbeat probe relies on; SOCKS works in both cores.
+  static CoreFeature? heartbeatProbeFeature(HeartbeatProbe probe) =>
+      switch (probe) {
+        HeartbeatProbe.socks => null,
+        HeartbeatProbe.xrayDelay => CoreFeature.coreDelayProbe,
+        HeartbeatProbe.passive => CoreFeature.passiveHeartbeat,
+      };
+
+  bool supportsHeartbeatProbe(HeartbeatProbe probe) {
+    final feature = heartbeatProbeFeature(probe);
+    return feature == null || supports(feature);
+  }
+
+  /// Probes offered by the settings picker, in the upstream order.
+  List<HeartbeatProbe> get heartbeatProbes =>
+      HeartbeatProbe.values.where(supportsHeartbeatProbe).toList();
+
+  /// The probe the native service receives. An unsupported stored probe is
+  /// replaced by SOCKS; the settings screen explains it and offers a reset.
+  HeartbeatProbe effectiveHeartbeatProbe(HeartbeatProbe requested) =>
+      supportsHeartbeatProbe(requested) ? requested : HeartbeatProbe.socks;
 
   /// Available features have no unavailability reason, in either build.
   String? unavailableReason(CoreFeature feature) {
@@ -88,6 +120,14 @@ class CoreFeatures {
         'Rust: управляемые JSON-конфиги и Observatory пока недоступны.',
       CoreFeature.rawConfig =>
         'Rust: поддерживается VLESS с TLS/Reality, включая TCP + Vision; полный JSON пока недоступен.',
+      CoreFeature.coreDelayProbe =>
+        'XRAYDELAY недоступен: в Rust-ядре нет встроенного замера задержки по URL, туннель проверяется SOCKS-пробой.',
+      CoreFeature.passiveHeartbeat =>
+        'PASSIVE в Go опирается на сторож зависаний tun2socks. В Rust-сборке его нет, и мёртвый туннель остался бы незамеченным, поэтому используется SOCKS-проба.',
+      CoreFeature.tetheringControl =>
+        'Rust-ядро не проверяет владельца потоков TUN: потоки без владельца не блокируются, и защита 1.6.4 от обхода исключений через tun0 здесь не действует.',
+      CoreFeature.outboundDelayProbe =>
+        'Rust: кандидаты проверяются TCP-пингом, а не замером через сам протокол; берутся только профили, которые поддерживает Rust-сборка.',
     };
   }
 }

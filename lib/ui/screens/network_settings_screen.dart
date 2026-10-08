@@ -77,6 +77,21 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
 
   void _update(AppSettings s) => ref.read(settingsProvider.notifier).save(s);
 
+  /// XRAYDELAY и PASSIVE есть только в Go. Сохранённое неподдерживаемое значение
+  /// остаётся видно с объяснением и явным сбросом на SOCKS-пробу.
+  Widget _heartbeatProbeGate(AppSettings s, bool locked, Widget child) {
+    final feature = CoreFeatures.heartbeatProbeFeature(s.heartbeat.probe);
+    if (feature == null) return child;
+    return FeatureGate(
+      feature: feature,
+      onReset: locked
+          ? null
+          : () => _update(
+              s.copyWith(heartbeat: s.heartbeat.copyWith(probe: HeartbeatProbe.socks))),
+      child: child,
+    );
+  }
+
   static String _fpLabel(TlsFingerprint fp) =>
       fp == TlsFingerprint.defaultFp ? 'DEFAULT' : fp.name.toUpperCase();
 
@@ -687,24 +702,33 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
                           ],
                         ),
                       ),
-SetSectionHeader(t: t, addr: '0x37', label: 'heartbeat'),
-                      _PickerRow(
-                        t: t,
-                        title: 'Тип проверки',
-                        hint: 'SOCKS — HTTP-запрос через SOCKS5 в xray; XRAYDELAY — замер внутри ядра, сразу даёт задержку; PASSIVE — без активных проб, только метрики tun2socks (экономит батарею, обрыв виден лишь при реальном трафике)',
-                        value: s.heartbeat.probe.name.toUpperCase(),
-                        locked: locked,
-                        onTap: () => _showEnumPicker<HeartbeatProbe>(
-                          context,
-                          title: 'heartbeat // probe',
-                          values: HeartbeatProbe.values,
-                          current: s.heartbeat.probe,
-                          labelOf: (v) => v.name.toUpperCase(),
-                          onPick: (v) =>
-                              _update(s.copyWith(heartbeat: s.heartbeat.copyWith(probe: v))),
+                      SetSectionHeader(t: t, addr: '0x37', label: 'heartbeat'),
+                      _heartbeatProbeGate(
+                        s,
+                        locked,
+                        _PickerRow(
+                          t: t,
+                          title: 'Тип проверки',
+                          hint: CoreFeatures.current.isRust
+                              ? 'SOCKS — HTTP(S)-запрос через локальный SOCKS5 в xray-rust. XRAYDELAY и PASSIVE есть только в Go-сборке'
+                              : 'SOCKS — HTTP-запрос через SOCKS5 в xray; XRAYDELAY — замер внутри ядра, сразу даёт задержку; PASSIVE — без активных проб, только метрики tun2socks (экономит батарею, обрыв виден лишь при реальном трафике)',
+                          value: s.heartbeat.probe.name.toUpperCase(),
+                          locked: locked,
+                          onTap: () => _showEnumPicker<HeartbeatProbe>(
+                            context,
+                            title: 'heartbeat // probe',
+                            values: CoreFeatures.current.heartbeatProbes,
+                            current: s.heartbeat.probe,
+                            labelOf: (v) => v.name.toUpperCase(),
+                            onPick: (v) =>
+                                _update(s.copyWith(heartbeat: s.heartbeat.copyWith(probe: v))),
+                          ),
                         ),
                       ),
-                      if (s.heartbeat.probe != HeartbeatProbe.passive) ...[
+                      // Адрес нужен любой активной пробе; в Rust сохранённый PASSIVE
+                      // заменяется SOCKS-пробой, которая стучится по этому адресу.
+                      if (CoreFeatures.current.effectiveHeartbeatProbe(s.heartbeat.probe) !=
+                          HeartbeatProbe.passive) ...[
                         _PickerRow(
                           t: t,
                           title: 'Адрес проверки',
@@ -775,7 +799,8 @@ SetSectionHeader(t: t, addr: '0x37', label: 'heartbeat'),
                         _PickerRow(
                           t: t,
                           title: 'Откуда брать конфиг',
-                          hint: 'SUBSCRIPTION — конфиги той же подписки; PINNED — закреплённые; ALL — все сохранённые. Кандидаты проверяются полноценным замером через сам протокол, не TCP-пингом',
+                          hint: 'SUBSCRIPTION — конфиги той же подписки; PINNED — закреплённые; ALL — все сохранённые. '
+                              '${CoreFeatures.current.unavailableReason(CoreFeature.outboundDelayProbe) ?? 'Кандидаты проверяются полноценным замером через сам протокол, не TCP-пингом'}',
                           value: s.heartbeat.switchSource.name.toUpperCase(),
                           locked: locked,
                           onTap: () => _showEnumPicker<SwitchSource>(

@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:teapodstream/core/constants/core_features.dart';
+import 'package:teapodstream/core/models/heartbeat_settings.dart';
 
 void main() {
   test('Go keeps all existing feature flags enabled', () {
@@ -24,6 +25,48 @@ void main() {
     ]) {
       expect(CoreFeatures.rust.supports(feature), isFalse);
       expect(CoreFeatures.rust.unavailableReason(feature), isNotEmpty);
+    }
+  });
+
+  test('Rust gates 1.6.4+ heartbeat probes, tethering and candidate measurement', () {
+    for (final feature in [
+      CoreFeature.coreDelayProbe,
+      CoreFeature.passiveHeartbeat,
+      CoreFeature.tetheringControl,
+      CoreFeature.outboundDelayProbe,
+    ]) {
+      expect(CoreFeatures.go.supports(feature), isTrue, reason: feature.name);
+      expect(CoreFeatures.rust.supports(feature), isFalse, reason: feature.name);
+      expect(CoreFeatures.rust.unavailableReason(feature), isNotEmpty);
+    }
+  });
+
+  test('Go keeps every heartbeat probe exactly as stored', () {
+    expect(CoreFeatures.go.heartbeatProbes, HeartbeatProbe.values);
+    for (final probe in HeartbeatProbe.values) {
+      expect(CoreFeatures.go.supportsHeartbeatProbe(probe), isTrue);
+      expect(CoreFeatures.go.effectiveHeartbeatProbe(probe), probe);
+    }
+  });
+
+  test('Rust offers only the SOCKS probe and normalizes stored probes to it', () {
+    expect(CoreFeatures.rust.heartbeatProbes, [HeartbeatProbe.socks]);
+    expect(CoreFeatures.heartbeatProbeFeature(HeartbeatProbe.socks), isNull);
+    for (final probe in HeartbeatProbe.values) {
+      expect(
+        CoreFeatures.rust.effectiveHeartbeatProbe(probe),
+        HeartbeatProbe.socks,
+        reason: probe.name,
+      );
+    }
+    for (final probe in [HeartbeatProbe.xrayDelay, HeartbeatProbe.passive]) {
+      expect(CoreFeatures.rust.supportsHeartbeatProbe(probe), isFalse);
+      expect(
+        CoreFeatures.rust.unavailableReason(
+          CoreFeatures.heartbeatProbeFeature(probe)!,
+        ),
+        isNotEmpty,
+      );
     }
   });
 

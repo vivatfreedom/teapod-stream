@@ -12,4 +12,6 @@ internal object CoreBridge {
     }
     fun activate(context: Context, revision: String): String =
         error("Atomic geodata activation is only used by the Rust build")
+    fun measureOutboundDelay(config: String, url: String): Long =
+        teapodcore.Teapodcore.measureOutboundDelay(config, url)
 }

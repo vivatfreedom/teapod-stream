@@ -158,6 +158,7 @@ class RustConfigBuilder {
         'ttl': 300,
       };
     }
+    _adaptDnsServers(result['dns'] as Map<String, dynamic>);
 
     final inbounds = result['inbounds'] as List<dynamic>;
     final socks = inbounds.single as Map<String, dynamic>;
@@ -207,6 +208,29 @@ class RustConfigBuilder {
       outbounds.insert(0, direct);
     }
     return result;
+  }
+
+  /// xray-rust reads a DoT server's port only from its `tls://` URL and ignores
+  /// the object's `port`, so a custom DoT port would silently become 853.
+  /// A plain server keeps `port`, but its IPv6 literal must be unbracketed.
+  static final _dotAuthorityWithPort =
+      RegExp(r'^tls://(\[[^\]]*\]|[^:\[\]]+):\d+$');
+
+  static void _adaptDnsServers(Map<String, dynamic> dns) {
+    for (final dynamic server in dns['servers'] as List<dynamic>) {
+      if (server is! Map) continue;
+      final address = server['address'] as String;
+      if (address.startsWith('tls://') && server['port'] is int) {
+        final port = server.remove('port');
+        // DnsServerConfig оставляет `]:port` у IPv6 в скобках; второй порт
+        // xray-rust отвергает, поэтому порт из URL сохраняем как есть.
+        if (!_dotAuthorityWithPort.hasMatch(address)) {
+          server['address'] = '$address:$port';
+        }
+      } else if (address.startsWith('[') && address.endsWith(']')) {
+        server['address'] = address.substring(1, address.length - 1);
+      }
+    }
   }
 
   /// Native Rust expects SHA-256 of the full DER certificate as hex.

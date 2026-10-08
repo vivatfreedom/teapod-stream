@@ -266,14 +266,24 @@ class VpnNotifier extends Notifier<VpnState2> {
           ref.read(configProvider).maybeWhen(data: (d) => d, orElse: () => null);
       if (configState == null) return;
       final current = _resolveEffectiveConfig(configState);
+      // Rust-сборка запускает только часть VLESS-профилей: неподдерживаемый
+      // кандидат не подключится, даже если сервер жив. В Go фильтр пропускает всё.
       final candidates =
-          _switchCandidates(configState, settings.heartbeat.switchSource, current);
+          _switchCandidates(configState, settings.heartbeat.switchSource, current)
+              .where(_engine.supportsConfig)
+              .toList();
       if (candidates.isEmpty) {
         log.addError('urltest: нет кандидатов для переключения (провалов: $failures)');
         return;
       }
 
-      log.addInfo('urltest: туннель не отвечает, проверяю ${candidates.length} конфиг(ов)',
+      // Rust: временного xray-инстанса для замера нет — кандидаты проверяются
+      // TCP-пингом, как в 1.6.3. Открытый порт ещё не значит рабочий протокол.
+      final measureOutbound =
+          CoreFeatures.current.supports(CoreFeature.outboundDelayProbe);
+      log.addInfo(
+          'urltest: туннель не отвечает, проверяю ${candidates.length} конфиг(ов)'
+          '${measureOutbound ? '' : ' TCP-пингом'}',
           source: 'urltest');
       // Замер идёт через временный xray-инстанс с конфигом кандидата: TCP-пинг
       // сказал бы «жив» и про сервер, у которого порт открыт, а протокол молчит.
@@ -290,7 +300,9 @@ class VpnNotifier extends Notifier<VpnState2> {
         mux: settings.mux,
       );
       final probed = await Future.wait(candidates.map((c) async {
-        final ms = await _engine.measureOutbound(c, options, settings.heartbeat.url);
+        final ms = measureOutbound
+            ? await _engine.measureOutbound(c, options, settings.heartbeat.url)
+            : await _engine.pingConfig(c);
         return (config: c, latency: ms);
       }));
       final alive = probed.where((r) => r.latency != null).toList()
@@ -539,6 +551,14 @@ class VpnNotifier extends Notifier<VpnState2> {
       activeSocksPassword: socksCredentials.password,
       appliedFingerprint: connectionFingerprint(settings),
     );
+    // XrayEngine отправит в native поддерживаемую пробу; подмена видна в журнале.
+    final probe = settings.heartbeat.probe;
+    if (!CoreFeatures.current.supportsHeartbeatProbe(probe)) {
+      ref.read(logServiceProvider.notifier).addWarning(
+          'heartbeat: проба ${probe.name.toUpperCase()} недоступна в этой сборке, '
+          'используется ${CoreFeatures.current.effectiveHeartbeatProbe(probe).name.toUpperCase()}',
+          source: 'heartbeat');
+    }
 
     try {
       await _engine.connect(config, options);

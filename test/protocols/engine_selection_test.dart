@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:teapodstream/core/constants/app_constants.dart';
 import 'package:teapodstream/core/constants/core_features.dart';
 import 'package:teapodstream/core/interfaces/vpn_engine.dart';
+import 'package:teapodstream/core/models/heartbeat_settings.dart';
 import 'package:teapodstream/core/models/vpn_config.dart';
 import 'package:teapodstream/protocols/xray/xray_engine.dart';
 
@@ -60,6 +61,89 @@ void main() {
       expect(sent!['socksPassword'], CoreFeatures.current.isRust ? '' : 'pass');
     },
   );
+
+  test('heartbeat probe and tethering reach native only where supported', () async {
+    Map<dynamic, dynamic>? sent;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'getEngine') {
+            return CoreFeatures.current.isRust ? 'rust' : 'go';
+          }
+          if (call.method == 'connect') sent = call.arguments as Map;
+          return null;
+        });
+    const custom = 'https://probe.example/generate_204';
+    for (final probe in HeartbeatProbe.values) {
+      await XrayEngine().connect(
+        config,
+        VpnEngineOptions(
+          socksPort: 10808,
+          httpPort: 0,
+          socksUser: '',
+          socksPassword: '',
+          allowTethering: true,
+          heartbeat: HeartbeatSettings(
+            probe: probe,
+            failAction: HeartbeatFailAction.switchConfig,
+            target: HeartbeatTarget.custom,
+            customUrl: custom,
+          ),
+        ),
+      );
+      expect(
+        sent!['heartbeatProbe'],
+        CoreFeatures.current.isRust ? 'socks' : probe.name,
+      );
+      expect(sent!['allowTethering'], !CoreFeatures.current.isRust);
+      // Rust's SOCKS probe supports HTTPS targets and switchConfig too.
+      expect(sent!['heartbeatUrl'], custom);
+      expect(sent!['heartbeatAction'], 'switchConfig');
+    }
+  });
+
+  test('candidate measurement uses a temporary Go core only in Go', () async {
+    final calls = <String>[];
+    Map<dynamic, dynamic>? measured;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+          calls.add(call.method);
+          if (call.method == 'measureOutbound') {
+            measured = call.arguments as Map;
+            return 42;
+          }
+          return null;
+        });
+    const url = 'http://cp.cloudflare.com/generate_204';
+    final latency = await XrayEngine().measureOutbound(config, options, url);
+    if (CoreFeatures.current.isRust) {
+      expect(latency, isNull);
+      expect(calls, isEmpty);
+    } else {
+      expect(latency, 42);
+      expect(measured!['url'], url);
+      final json = jsonDecode(measured!['config'] as String) as Map;
+      expect(
+        (json['inbounds'] as List).any((dynamic i) => i['protocol'] == 'tun'),
+        isFalse,
+      );
+    }
+  });
+
+  test('switch candidates are limited to profiles the selected core runs', () {
+    final vmess = VpnConfig(
+      id: 'vmess',
+      name: 'vmess',
+      protocol: VpnProtocol.vmess,
+      address: 'server.example',
+      port: 443,
+      uuid: '11111111-2222-4333-8444-555555555555',
+      security: VpnSecurity.tls,
+      transport: VpnTransport.tcp,
+      createdAt: DateTime(2026),
+    );
+    expect(XrayEngine().supportsConfig(config), isTrue);
+    expect(XrayEngine().supportsConfig(vmess), !CoreFeatures.current.isRust);
+  });
 
   test('a mismatched native core never receives a connect command', () async {
     var connected = false;

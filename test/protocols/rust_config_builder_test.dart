@@ -22,8 +22,10 @@ String profile({String network = 'xhttp', bool extra = true}) {
 VpnEngineOptions options({
   RoutingSettings routing = const RoutingSettings(),
   DnsMode dnsMode = DnsMode.proxy,
+  DnsServerConfig dnsServer = DnsServerConfig.cloudflare,
   bool proxyOnly = false,
   bool blockQuic = false,
+  bool allowTethering = false,
 }) => VpnEngineOptions(
   socksPort: 12345,
   httpPort: 0,
@@ -31,9 +33,31 @@ VpnEngineOptions options({
   socksPassword: 'random-password',
   routing: routing,
   dnsMode: dnsMode,
+  dnsServer: dnsServer,
   proxyOnly: proxyOnly,
   blockQuic: blockQuic,
+  allowTethering: allowTethering,
 );
+
+Map<String, dynamic> rustDns(DnsServerConfig server, {bool fakeDns = false}) {
+  final json = RustConfigBuilder.build(
+    VlessParser.parseUri(profile())!,
+    options(
+      dnsServer: server,
+      routing: fakeDns
+          ? const RoutingSettings(
+              direction: RoutingDirection.bypass,
+              geositeEnabled: true,
+              geositeCodes: ['youtube'],
+            )
+          : const RoutingSettings(),
+    ),
+  );
+  return json['dns'] as Map<String, dynamic>;
+}
+
+DnsServerConfig customDns(String address, DnsType type) =>
+    DnsServerConfig.fromPreset('custom', customAddress: address, customType: type);
 
 void main() {
   test('preserves XHTTP Reality identity and padding independently', () {
@@ -182,6 +206,96 @@ void main() {
             r['outboundTag'] == 'direct',
       ),
       isTrue,
+    );
+  });
+
+  test('the selected DNS server stays first and fallback stays disabled', () {
+    for (final fakeDns in [false, true]) {
+      final dns = rustDns(DnsServerConfig.cloudflare, fakeDns: fakeDns);
+      expect(dns['servers'], [
+        {'address': '1.1.1.1', 'port': 53},
+      ]);
+      expect(dns['disableFallback'], isTrue);
+      expect(dns['tag'], 'dns-module');
+      expect(dns.containsKey('fakeIp'), fakeDns);
+    }
+  });
+
+  test('custom DoT keeps its port inside the tls:// URL read by xray-rust', () {
+    final dns = rustDns(customDns('xbox-dns.ru:5853', DnsType.dot));
+    final servers = dns['servers'] as List;
+    // xray-rust ignores `port` next to a tls:// address.
+    expect(servers.first, {'address': 'tls://xbox-dns.ru:5853'});
+    expect(servers.last, {
+      'address': '8.8.8.8',
+      'port': 53,
+      'domains': ['xbox-dns.ru'],
+    });
+    expect(dns['disableFallback'], isTrue);
+    expect(
+      (rustDns(customDns('tls://xbox-dns.ru', DnsType.dot))['servers']
+              as List)
+          .first,
+      {'address': 'tls://xbox-dns.ru:853'},
+    );
+  });
+
+  test('bracketed IPv6 DoT with a port is not given a second port', () {
+    // DnsServerConfig keeps `]:853` in the address; xray-rust rejects `:853:853`.
+    final servers =
+        rustDns(customDns('[2606:4700:4700::1111]:853', DnsType.dot))['servers']
+            as List;
+    expect(servers.first, {'address': 'tls://[2606:4700:4700::1111]:853'});
+    expect(
+      (rustDns(customDns('[2001:db8::1]', DnsType.dot))['servers'] as List)
+          .first,
+      {'address': 'tls://[2001:db8::1]:853'},
+    );
+  });
+
+  test('DoT preset uses its domain, port 853 and static host', () {
+    final dns = rustDns(DnsServerConfig.cloudflareDoT);
+    expect(dns['servers'], [
+      {'address': 'tls://cloudflare-dns.com:853'},
+    ]);
+    expect(dns['hosts'], {'cloudflare-dns.com': '1.1.1.1'});
+  });
+
+  test('custom DoH keeps its URL port and gets a bootstrap after it', () {
+    final dns = rustDns(
+      customDns('https://dns.example.org:8443/dns-query', DnsType.doh),
+    );
+    expect(dns['servers'], [
+      {'address': 'https://dns.example.org:8443/dns-query'},
+      {
+        'address': '8.8.8.8',
+        'port': 53,
+        'domains': ['dns.example.org'],
+      },
+    ]);
+  });
+
+  test('a bracketed IPv6 UDP server is passed as a bare literal', () {
+    final dns = rustDns(customDns('[2001:db8::1]', DnsType.udp));
+    expect(dns['servers'], [
+      {'address': '2001:db8::1', 'port': 53},
+    ]);
+  });
+
+  test('bare and bracketed-with-port IPv6 UDP servers keep the full address', () {
+    expect(rustDns(customDns('2001:db8::1', DnsType.udp))['servers'], [
+      {'address': '2001:db8::1', 'port': 53},
+    ]);
+    expect(rustDns(customDns('[2001:db8::1]:5353', DnsType.udp))['servers'], [
+      {'address': '2001:db8::1', 'port': 5353},
+    ]);
+  });
+
+  test('the tethering switch does not affect the Rust config', () {
+    final config = VlessParser.parseUri(profile())!;
+    expect(
+      RustConfigBuilder.buildJson(config, options(allowTethering: true)),
+      RustConfigBuilder.buildJson(config, options()),
     );
   });
 

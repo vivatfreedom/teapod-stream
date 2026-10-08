@@ -61,9 +61,14 @@ class XrayEngine implements VpnEngine {
       'allowIcmp': options.allowIcmp,
       'blockQuic': options.blockQuic,
       'ipv6Enabled': options.ipv6Enabled,
-      'allowTethering': options.allowTethering,
+      // Rust has no per-flow owner check, so the switch has nothing to control.
+      'allowTethering':
+          CoreFeatures.current.supports(CoreFeature.tetheringControl) &&
+          options.allowTethering,
       'mtu': options.mtu,
-      'heartbeatProbe': options.heartbeat.probe.name,
+      'heartbeatProbe': CoreFeatures.current
+          .effectiveHeartbeatProbe(options.heartbeat.probe)
+          .name,
       'heartbeatAction': options.heartbeat.failAction.name,
       'heartbeatThreshold': options.heartbeat.failureThreshold,
       'heartbeatUrl': options.heartbeat.url,
@@ -78,7 +83,9 @@ class XrayEngine implements VpnEngine {
 
   /// Замер задержки через кандидата: временный xray-инстанс с его конфигом
   /// (`Teapodcore.measureOutboundDelay`). null — сервер не ответил.
+  /// В Rust-сборке временного инстанса нет: null без обращения к native.
   Future<int?> measureOutbound(VpnConfig config, VpnEngineOptions options, String url) async {
+    if (!CoreFeatures.current.supports(CoreFeature.outboundDelayProbe)) return null;
     try {
       final xrayConfig = config.rawXrayConfig != null
           ? XrayConfigBuilder.mergeWithRaw(config.rawXrayConfig!, options)

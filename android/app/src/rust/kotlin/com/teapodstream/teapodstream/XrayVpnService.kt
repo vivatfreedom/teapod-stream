@@ -32,6 +32,10 @@ import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLPeerUnverifiedException
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 
 class XrayVpnService : VpnService() {
 
@@ -58,9 +62,12 @@ class XrayVpnService : VpnService() {
         const val EXTRA_ALLOW_ICMP = "allow_icmp" // allow ICMP echo (ping) through the tunnel
         const val EXTRA_BLOCK_QUIC = "block_quic" // reject UDP/443 inside the TUN via ICMP Port Unreachable
         const val EXTRA_IPV6 = "ipv6_enabled" // add IPv6 address/route to the TUN interface
+        const val EXTRA_ALLOW_TETHERING = "allow_tethering" // allExcept: let unowned (tethered) flows in
         const val EXTRA_MTU = "mtu" // TUN MTU size
-        const val EXTRA_HEARTBEAT_ACTION = "heartbeat_action"    // "reconnect" | "urltest"
+        const val EXTRA_HEARTBEAT_PROBE = "heartbeat_probe"      // "socks" | "xrayDelay" | "passive" (Rust: только socks)
+        const val EXTRA_HEARTBEAT_ACTION = "heartbeat_action"    // "reconnect" | "switchConfig" (старое имя "urltest")
         const val EXTRA_HEARTBEAT_THRESHOLD = "heartbeat_threshold" // провалов подряд до действия
+        const val EXTRA_HEARTBEAT_URL = "heartbeat_url"          // куда стучится проба
 
         // Static state tracker for querying from Dart
         @Volatile private var currentNativeState: String = "disconnected"
@@ -137,6 +144,9 @@ class XrayVpnService : VpnService() {
         private const val NOTIFICATION_ID = 1
 
         private const val HEARTBEAT_URL_HOST = "cp.cloudflare.com"
+        private const val DEFAULT_HEARTBEAT_URL = "http://cp.cloudflare.com/generate_204"
+        // Статус-строка ответа пробы: "HTTP/1.1 204 No Content" → 204.
+        private val HTTP_STATUS_LINE = Regex("^HTTP/\\d(?:\\.\\d)?\\s+(\\d{3})(?:\\s|$)")
         private const val CONNECTIVITY_CHECK_HOST = "8.8.8.8"
         private const val HEARTBEAT_INTERVAL_MS = 15_000L
         // Screen off: nobody is watching, the radio should be allowed to idle between
@@ -236,10 +246,19 @@ class XrayVpnService : VpnService() {
     private var pendingNetworkRunnable: Runnable? = null
     private var heartbeatThread: Thread? = null
     private val heartbeatFailures = AtomicInteger(0)
+    // Чем щупаем туннель. Rust-сборка умеет только "socks" (HTTP/HTTPS через SOCKS5):
+    // другие значения сводятся к нему в applyHeartbeatProbe().
+    private var heartbeatProbe: String = "socks"
+    // Запрошенная, но неподдерживаемая проба — пишется в лог один раз при старте VPN.
+    @Volatile private var unsupportedHeartbeatProbe: String? = null
     // Поведение при мёртвом туннеле: "reconnect" — переподключить тот же сервер,
-    // "urltest" — отдать решение Flutter (он подберёт живой конфиг).
+    // "switchConfig" (до 1.6.4 — "urltest") — отдать решение Flutter (он подберёт живой конфиг).
     private var heartbeatAction: String = "reconnect"
     private var heartbeatThreshold: Int = 3
+    private var heartbeatUrl: String = DEFAULT_HEARTBEAT_URL
+    // В Go-сборке пропускает потоки без владельца в allExcept. Rust-ядро потоки по
+    // владельцу не фильтрует — значение только сохраняется в ConnectionParams.
+    @Volatile private var allowTethering = false
     private var lastTunnelDeadNotifyAt = 0L
     private val wakeProbeRunning = AtomicBoolean(false)
     private val reconnectAttempts = AtomicInteger(0)
@@ -315,12 +334,16 @@ class XrayVpnService : VpnService() {
                 val blockQuic = intent.getBooleanExtra(EXTRA_BLOCK_QUIC, false)
                 val ipv6Enabled = intent.getBooleanExtra(EXTRA_IPV6, false)
                 val mtu = intent.getIntExtra(EXTRA_MTU, 1500).coerceIn(576, 9000)
+                applyHeartbeatProbe(intent.getStringExtra(EXTRA_HEARTBEAT_PROBE))
                 heartbeatAction = intent.getStringExtra(EXTRA_HEARTBEAT_ACTION) ?: "reconnect"
                 heartbeatThreshold = intent.getIntExtra(EXTRA_HEARTBEAT_THRESHOLD, 3).coerceIn(1, 10)
+                heartbeatUrl = intent.getStringExtra(EXTRA_HEARTBEAT_URL)?.takeIf { it.isNotEmpty() }
+                    ?: DEFAULT_HEARTBEAT_URL
+                allowTethering = intent.getBooleanExtra(EXTRA_ALLOW_TETHERING, false)
                 // Persist non-sensitive params for CONNECT_QUICK reconnect (no credentials)
                 ConnectionParams(socksPort, excludedPackages, includedPackages,
                     vpnMode, ssPrefix, proxyOnly, showNotification, killSwitch, allowIcmp, blockQuic, ipv6Enabled, mtu,
-                    heartbeatAction, heartbeatThreshold)
+                    heartbeatProbe, heartbeatAction, heartbeatThreshold, heartbeatUrl, allowTethering)
                     .save(filesDir, ::log)
                 userRequestedDisconnect.set(false)
                 reconnectAttempts.set(0)
@@ -339,8 +362,11 @@ class XrayVpnService : VpnService() {
                 val params = ConnectionParams.load(filesDir)
                 if (params != null) {
                     showNotification = params.showNotification
+                    applyHeartbeatProbe(params.heartbeatProbe)
                     heartbeatAction = params.heartbeatAction
                     heartbeatThreshold = params.heartbeatThreshold
+                    heartbeatUrl = params.heartbeatUrl
+                    allowTethering = params.allowTethering
                 }
                 ensureForeground()
                 if (isRunning.get()) {
@@ -402,8 +428,11 @@ class XrayVpnService : VpnService() {
         val params = ConnectionParams.load(filesDir)
         if (params != null) {
             showNotification = params.showNotification
+            applyHeartbeatProbe(params.heartbeatProbe)
             heartbeatAction = params.heartbeatAction
             heartbeatThreshold = params.heartbeatThreshold
+            heartbeatUrl = params.heartbeatUrl
+            allowTethering = params.allowTethering
         }
         ensureForeground()
         // Auto-connect if saved params exist and user didn't explicitly disconnect.
@@ -505,6 +534,12 @@ class XrayVpnService : VpnService() {
         if (!isReconnect) clearLogFile()
         setState(if (isReconnect) "reconnecting" else "connecting")
         log("info", "Starting VPN (MTU: $tunMtu)")
+        // После clearLogFile(), чтобы причина подмены пробы осталась в логе этой сессии.
+        unsupportedHeartbeatProbe?.let {
+            unsupportedHeartbeatProbe = null
+            log("warning", "Heartbeat probe \"$it\" не поддерживается Rust-ядром " +
+                "(нет замера внутри ядра и метрик tun2socks), используется socks")
+        }
 
         try {
             require(!proxyOnly) { "Rust-пробник поддерживает только TUN" }
@@ -595,6 +630,16 @@ class XrayVpnService : VpnService() {
                     // The new interface replaced the old one atomically — the sink fd can go now.
                     try { previousTun?.close() } catch (_: Exception) {}
                     log("info", "TUN established with IP $dynamicTunIp")
+                }
+
+                // Go-сборка отбрасывает потоки без владельца (uid=-1: тетеринг или приложение
+                // вне VPN, привязавшее сокет к TUN): в «ТОЛЬКО» всегда, в «КРОМЕ» при
+                // исключениях без allowTethering. xray-rust читает TUN fd сам, проверки
+                // владельца потока в нём нет — честно пишем об этом, без имитации фильтра.
+                if (vpnMode == "onlySelected" || excludedPackages.isNotEmpty()) {
+                    log("info", "Split tunnel ($vpnMode): per-flow owner filtering is unavailable in the Rust core, " +
+                        "apps outside the VPN that bind to tun0 are not blocked" +
+                        if (vpnMode == "onlySelected") "" else " (allowTethering=$allowTethering has no effect)")
                 }
 
                 // Rust borrows the Android fd and handles IP packets directly.
@@ -870,7 +915,7 @@ class XrayVpnService : VpnService() {
                 val port = activeSocksPort
                 if (port <= 0) return@Thread
                 try {
-                    checkTunnelConnectivity(port)
+                    runProbe(port)
                     log("info", "TUN idle ${idleSec}s on wake but tunnel alive, skipping reconnect")
                 } catch (e: Exception) {
                     log("warning", "TUN stall on wake: no data for ${idleSec}s, probe failed (${e.message}), reconnecting")
@@ -1143,26 +1188,31 @@ class XrayVpnService : VpnService() {
             heartbeatFailures.set(0)
             return true
         }
-        if (heartbeatAction == "urltest") {
+        // "urltest" — имя switchConfig до 1.6.4; так оно записано в ConnectionParams старых сборок.
+        if (heartbeatAction == "switchConfig" || heartbeatAction == "urltest") {
             val now = System.currentTimeMillis()
             if (now - lastTunnelDeadNotifyAt >= TUNNEL_DEAD_NOTIFY_COOLDOWN_MS) {
                 lastTunnelDeadNotifyAt = now
-                log("warning", "$reason ($failures), requesting urltest switch")
+                log("warning", "$reason (провалов: $failures) → подбор другого конфига")
                 VpnEventStreamHandler.sendTunnelDeadEvent(failures)
                 heartbeatFailures.set(0)
                 return true
             }
             // Flutter не отреагировал за cooldown (приложение убито / нет живых
             // кандидатов) — деградируем в обычный реконнект текущего сервера.
-            log("warning", "urltest: no switch within cooldown, falling back to reconnect")
+            log("warning", "switchConfig: no switch within cooldown, falling back to reconnect")
         }
-        log("warning", "$reason $failures times, reconnecting")
+        log("warning", "$reason (провалов: $failures) → reconnect")
         reconnectInternal()
         return false
     }
 
     private fun startHeartbeat(isReconnect: Boolean = false) {
         log("info", "startHeartbeat (isReconnect=$isReconnect)")
+        if (parseProbeUrl(heartbeatUrl) == null) {
+            log("warning", "Heartbeat URL \"$heartbeatUrl\" не разобран (нужен http:// или https:// с хостом), " +
+                "проба идёт на $DEFAULT_HEARTBEAT_URL")
+        }
         heartbeatThread?.interrupt()
         heartbeatFailures.set(0)
         lastTunnelDeadNotifyAt = 0L
@@ -1213,7 +1263,7 @@ class XrayVpnService : VpnService() {
                     // demonstrably alive, no need to burn a radio round-trip on an
                     // active probe. Idle tunnels still get the full SOCKS5 probe.
                     if (!isTunRxFresh()) {
-                        checkTunnelConnectivity(port)
+                        runProbe(port)
                     }
                     warmupDone = true
                     heartbeatFailures.set(0)
@@ -1274,7 +1324,7 @@ class XrayVpnService : VpnService() {
                     while (immediateRetries < 2 && !Thread.currentThread().isInterrupted) {
                         try {
                             Thread.sleep(3000)
-                            checkTunnelConnectivity(activeSocksPort)
+                            runProbe(activeSocksPort)
                             warmupDone = true
                             heartbeatFailures.set(0)
                             break
@@ -1308,15 +1358,61 @@ class XrayVpnService : VpnService() {
         heartbeatFailures.set(0)
     }
 
+    /// Rust-ядро умеет только socks-пробу: замера внутри ядра (xrayDelay) у xray-rust
+    /// нет, а passive опирается на метрики и stall watchdog tun2socks, которых в
+    /// Rust-сервисе нет — без активных проб мёртвый туннель остался бы незамеченным.
+    /// Dart в Rust-сборке шлёт только "socks"; остальное сводим к нему и пишем в лог.
+    private fun applyHeartbeatProbe(requested: String?) {
+        heartbeatProbe = "socks"
+        unsupportedHeartbeatProbe = requested?.takeIf { it.isNotEmpty() && it != "socks" }
+    }
+
+    /// Разбор URL пробы: хост, порт и путь с query. Пресеты плоские (http), но
+    /// кастомный URL пользователь может задать любой. Go меряет https-URL внутри
+    /// ядра; у xray-rust такого API нет, поэтому TLS поднимаем сами поверх SOCKS5.
+    /// null — URL не годится (не http/https или без хоста).
+    private data class ProbeUrl(val host: String, val port: Int, val path: String, val https: Boolean)
+
+    private fun parseProbeUrl(raw: String): ProbeUrl? {
+        return try {
+            val u = java.net.URI(raw.trim())
+            val scheme = u.scheme?.lowercase()
+            // URI.host отдаёт IPv6-литерал в скобках ("[2606:4700:4700::1111]"):
+            // в SOCKS и в проверку имени сертификата идёт голый адрес.
+            val host = u.host?.removeSurrounding("[", "]")
+            if ((scheme != "http" && scheme != "https") || host.isNullOrEmpty()) return null
+            val https = scheme == "https"
+            val path = if (u.rawPath.isNullOrEmpty()) "/" else u.rawPath
+            ProbeUrl(
+                host = host,
+                port = if (u.port > 0) u.port else if (https) 443 else 80,
+                path = if (u.rawQuery != null) "$path?${u.rawQuery}" else path,
+                https = https,
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /// Активная проба. В Rust-сборке heartbeatProbe всегда "socks" (см. applyHeartbeatProbe):
+    /// HTTP или HTTPS через SOCKS5. Бросает исключение при неудаче — heartbeat-цикл
+    /// считает это провалом.
+    private fun runProbe(port: Int) {
+        checkTunnelConnectivity(port)
+    }
+
     private fun checkTunnelConnectivity(port: Int) {
+        val probeUrl = parseProbeUrl(heartbeatUrl)
+            ?: ProbeUrl(HEARTBEAT_URL_HOST, 80, "/generate_204", false)
         var stage = "init"
         val socket = Socket()
+        var tlsSocket: SSLSocket? = null
         try {
             socket.soTimeout = 10000
             stage = "tcp_connect"
             socket.connect(InetSocketAddress("127.0.0.1", port), 10000)
-            val out = socket.getOutputStream()
-            val inp = socket.getInputStream()
+            var out = socket.getOutputStream()
+            var inp = socket.getInputStream()
 
             stage = "socks_greeting"
             out.write(byteArrayOf(5, 2, 0, 2))
@@ -1341,50 +1437,84 @@ class XrayVpnService : VpnService() {
             }
 
             stage = "socks_connect"
-            val destHost = HEARTBEAT_URL_HOST
-            val destPort = 80
-            val domainBytes = destHost.toByteArray()
-            out.write(
-                byteArrayOf(5, 1, 0, 3, domainBytes.size.toByte()) +
-                domainBytes +
-                byteArrayOf((destPort shr 8).toByte(), destPort.toByte())
-            )
+            val destHost = probeUrl.host
+            val destPort = probeUrl.port
+            val portBytes = byteArrayOf((destPort shr 8).toByte(), destPort.toByte())
+            // ':' в хосте бывает только у IPv6-литерала (иначе URI не разобрал бы хост).
+            val ipv6Literal = destHost.contains(':')
+            if (ipv6Literal) {
+                // Литерал: getByName не ходит в DNS; ::ffff:a.b.c.d превращается в Inet4Address.
+                val addr = java.net.InetAddress.getByName(destHost).address
+                out.write(byteArrayOf(5, 1, 0, if (addr.size == 16) 4 else 1) + addr + portBytes)
+            } else {
+                val domainBytes = destHost.toByteArray()
+                if (domainBytes.size > 255) throw Exception("Probe host too long")
+                out.write(byteArrayOf(5, 1, 0, 3, domainBytes.size.toByte()) + domainBytes + portBytes)
+            }
 
             val replyVer = inp.read()
             val replyRep = inp.read()
             val replyRsv = inp.read()
             val replyAtyp = inp.read()
             if (replyVer != 5 || replyRep != 0) throw Exception("SOCKS connect failed: $replyRep")
-            if (replyAtyp == 1) {
-                val buf = ByteArray(6)
-                var read = 0; while (read < buf.size) read += inp.read(buf, read, buf.size - read)
-            } else if (replyAtyp == 4) {
-                val buf = ByteArray(18)
-                var read = 0; while (read < buf.size) read += inp.read(buf, read, buf.size - read)
-            } else if (replyAtyp == 3) {
-                val len = inp.read()
-                val buf = ByteArray(len + 2)
-                var read = 0; while (read < buf.size) read += inp.read(buf, read, buf.size - read)
+            // readFully, а не цикл с read(): на EOF read() возвращает -1, и такой
+            // цикл крутился бы вечно, подвешивая heartbeat-поток.
+            when (replyAtyp) {
+                1 -> readFully(inp, ByteArray(6))
+                4 -> readFully(inp, ByteArray(18))
+                3 -> {
+                    val len = inp.read()
+                    if (len < 0) throw Exception("EOF while reading SOCKS response")
+                    readFully(inp, ByteArray(len + 2))
+                }
+            }
+
+            if (probeUrl.https) {
+                // TLS до целевого хоста внутри SOCKS-туннеля: успешное рукопожатие и
+                // ответ 2xx/3xx показывают, что через прокси доходит не только TCP.
+                stage = "tls_handshake"
+                val tls = (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                    .createSocket(socket, destHost, destPort, true) as SSLSocket
+                tlsSocket = tls
+                tls.soTimeout = 10000
+                tls.startHandshake()
+                // SSLSocket проверяет цепочку сертификатов, но не имя хоста — сверяем сами.
+                stage = "tls_verify"
+                if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(destHost, tls.session)) {
+                    throw SSLPeerUnverifiedException("Certificate does not match $destHost")
+                }
+                out = tls.outputStream
+                inp = tls.inputStream
             }
 
             stage = "http_request"
-            val request = "GET /generate_204 HTTP/1.1\r\nHost: $destHost\r\nConnection: close\r\n\r\n"
+            val defaultPort = if (probeUrl.https) 443 else 80
+            val hostName = if (ipv6Literal) "[$destHost]" else destHost
+            val hostHeader = if (destPort == defaultPort) hostName else "$hostName:$destPort"
+            val request = "GET ${probeUrl.path} HTTP/1.1\r\nHost: $hostHeader\r\nConnection: close\r\n\r\n"
             out.write(request.toByteArray())
             out.flush()
 
             stage = "http_response"
-            val reader = BufferedReader(InputStreamReader(inp))
+            val reader = BufferedReader(InputStreamReader(inp, Charsets.ISO_8859_1))
             val line = reader.readLine()
-            if (line == null || !line.contains("204")) {
+            // Любой 2xx: кастомный URL не обязан отвечать именно 204. Для https годится
+            // и 3xx: он пришёл по TLS, проверенному на целевой хост, — туннель жив
+            // (Go через net/http прошёл бы по редиректу и получил 200).
+            val code = line?.let { HTTP_STATUS_LINE.find(it) }?.groupValues?.get(1)?.toIntOrNull()
+            val ok = code != null && (code in 200..299 || (probeUrl.https && code in 300..399))
+            if (!ok) {
                 throw Exception("Invalid HTTP response: $line")
             }
 
             heartbeatFailures.set(0)
-            log("debug", "Heartbeat OK")
+            log("debug", if (probeUrl.https) "Heartbeat OK (https, HTTP $code)" else "Heartbeat OK")
         } catch (e: Exception) {
             log("warning", "Heartbeat check failed at [$stage]: ${e.message}")
             throw e
         } finally {
+            // autoClose=true: закрытие TLS-сокета закрывает и нижележащий.
+            try { tlsSocket?.close() } catch (_: Exception) {}
             socket.close()
         }
     }

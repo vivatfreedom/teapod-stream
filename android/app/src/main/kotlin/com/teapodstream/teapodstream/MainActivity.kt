@@ -169,7 +169,7 @@ class MainActivity : FlutterActivity() {
                         val url = call.argument<String>("url") ?: ""
                         Thread {
                             val latency = try {
-                                teapodcore.Teapodcore.measureOutboundDelay(config, url)
+                                CoreBridge.measureOutboundDelay(config, url)
                             } catch (e: Exception) {
                                 -1L
                             }

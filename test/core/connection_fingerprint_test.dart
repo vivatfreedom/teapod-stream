@@ -1,4 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:teapodstream/core/constants/core_features.dart';
+import 'package:teapodstream/core/models/heartbeat_settings.dart';
 import 'package:teapodstream/core/models/connection_fingerprint.dart';
 import 'package:teapodstream/core/services/settings_service.dart';
 
@@ -40,6 +42,25 @@ void main() {
       final a = const AppSettings().copyWith(excludedPackages: {'b', 'a'});
       final b = const AppSettings().copyWith(excludedPackages: {'a', 'b'});
       expect(connectionFingerprint(a), connectionFingerprint(b));
+    });
+
+    test('учитывает только значения, которые доходят до native', () {
+      const base = AppSettings();
+      final passive = base.copyWith(
+          heartbeat: base.heartbeat.copyWith(probe: HeartbeatProbe.passive));
+      final socks = base.copyWith(
+          heartbeat: base.heartbeat.copyWith(probe: HeartbeatProbe.socks));
+      final tethering = base.copyWith(allowTethering: true);
+      final noTethering = base.copyWith(allowTethering: false);
+      if (CoreFeatures.current.isRust) {
+        // Rust шлёт SOCKS и allowTethering=false: сброс этих значений сессию не меняет.
+        expect(connectionFingerprint(passive), connectionFingerprint(socks));
+        expect(connectionFingerprint(tethering), connectionFingerprint(noTethering));
+      } else {
+        expect(connectionFingerprint(passive), isNot(connectionFingerprint(socks)));
+        expect(connectionFingerprint(tethering),
+            isNot(connectionFingerprint(noTethering)));
+      }
     });
   });
 }
