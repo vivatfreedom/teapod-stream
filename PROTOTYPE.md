@@ -1,11 +1,11 @@
 # TeapodStream: Go and experimental Rust builds
 
 The default build uses Go/teapod-core. The separate Rust build uses
-**xray-rust 0.6.1+geo.1** and its direct TUN file-descriptor backend.
+**xray-rust 0.7.0** and its direct TUN file-descriptor backend.
 Rust application ID: `com.teapodstream.rustprobe`. It installs alongside the original TeapodStream.
 No live VPN profile or credentials are bundled.
 
-## Rust support (1.6.3-rust.5)
+## Rust support (1.6.6-rust.6)
 
 - VLESS with `encryption=none` over TCP/RAW, WebSocket, HTTPUpgrade, gRPC,
   XHTTP/SplitHTTP. TLS is supported on all these carriers; REALITY on TCP/RAW,
@@ -23,6 +23,10 @@ No live VPN profile or credentials are bundled.
   REALITY SNI, fingerprint, public key, short ID and spiderX.
 - Direct TUN, TCP/UDP, DNS through the proxy, Android per-app inclusion/exclusion,
   existing reconnect and TUN-sink kill-switch paths.
+- App selection is enforced only by Android's VPN UID ranges. The Rust core has
+  no per-flow owner check like Go's tun2socks validator, so in both split-tunnel
+  modes an app outside the VPN that binds a socket to `tun0` (SO_BINDTODEVICE,
+  kernel 5.7+) is not blocked, and the tethering toggle is disabled.
 - GeoIP, GeoSite, domain suffixes, individual sites and Russian-service lists.
   BYPASS sends matches directly; ONLY sends matches through VLESS. FULL disables
   destination rules. The app selection is applied by Android before these rules.
@@ -36,6 +40,13 @@ No live VPN profile or credentials are bundled.
   may evade GeoSite matching; turn off their secure-DNS override and restart them
   after changing routing. FakeDNS returns IPv4 and suppresses AAAA in this mode.
 - Ad blocking remains unsupported in this build.
+- Heartbeat uses the SOCKS probe only. Custom `http://` and `https://` targets
+  work; HTTPS runs TLS with certificate and hostname checks inside the SOCKS
+  tunnel. Go's XRAYDELAY (in-core measurement) and PASSIVE (relies on the
+  tun2socks stall watchdog) are gated; a stored unsupported probe is sent as SOCKS.
+- When failed heartbeats switch configurations, Rust checks candidates with a
+  TCP ping and considers only profiles it supports; Go measures them through a
+  temporary core instance.
 
 The Rust build requires MTU 1500, UDP enabled and QUIC blocking disabled.
 Proxy-only mode, raw Xray JSON, legacy mux, fragmentation/noise and other proxy
@@ -76,7 +87,7 @@ For direct Flutter commands, prepare dependencies first:
 ./build-rust.sh binaries
 flutter build apk --release --dart-define=TEAPOD_CORE=rust \
   --target-platform android-arm64,android-x64 --split-per-abi \
-  --build-name=1.6.3-rust.5 --build-number=10608
+  --build-name=1.6.6-rust.6 --build-number=10609
 
 # Native Android binding tests use the same base64-encoded Flutter flag.
 cd android
@@ -97,8 +108,8 @@ Rust additionally needs rustup; its first build installs Rust 1.96.0 and the
 Android targets. `JAVA_HOME` is honored without changing global Flutter settings.
 
 `fetch-go-core.py` downloads checksum-pinned teapod-core 1.1.15. Both builds use
-the same checksum-pinned geodata assets. `build-rust-core.py` builds the pinned
-Rust source with the documented geodata budget patch. See
+the same checksum-pinned geodata assets. `build-rust-core.py` builds the pinned,
+unmodified Rust source and refuses a checkout with local changes. See
 [Android binding notes](android/xraymobile/README.md).
 
 The original Go service is preserved in `android/app/src/go/`; the tested Rust
@@ -108,6 +119,68 @@ must be evaluated for both implementations.
 
 Controlled battery savings have not been measured. These builds support
 comparison; phone battery-screen observations are not a controlled A/B result.
+
+## TeapodStream 1.6.6 and core 0.7.0 (1.6.6-rust.6)
+
+The fork now merges upstream TeapodStream 1.6.6. The core moves to stable
+xray-rust v0.7.0, commit `67969094b352f948c6b8b9e2ac75402c577cb7f7`, built
+without local changes: 0.7.0 ships the same GeoIP budgets that the removed
+`geo-budgets.patch` added (500,000 CIDRs per category, 750,000 IP matchers,
+1,000,000 matchers in total). The C ABI goes from 1.4 to 1.7 with additive
+changes only. The binding is resynchronised with v0.7.0 and keeps the local
+`geodataDirectory` extension. Hysteria 2, WireGuard, profile import and carrier
+rebinding are in the core but are not used by the app yet. Package ID, signing
+key and bundled geodata are unchanged, so the APK installs over earlier Rust
+Probe versions.
+
+Relevant core changes for VLESS through TUN:
+- A client TCP FIN is forwarded after buffered upload drains, so replies
+  after a half-close are kept and naturally closed flows are released.
+- Download and cancellation stay responsive while an upload is blocked.
+- Fewer allocations in async setup and bounded TUN upload queues.
+- The 0.7.0 changelog has no TLS/Vision change. Vision over ordinary TLS
+  stays gated without a new test.
+
+Upstream 1.6.4–1.6.6 in the Rust build:
+- Custom DoT/DoH/UDP DNS addresses with default ports work. xray-rust takes a
+  DoT port only from its `tls://` URL, so the Rust builder writes it there.
+  The upstream parser mangled IPv6 literals (`2001:db8::1`,
+  `[2001:db8::1]:5353`); the fix applies to both builds.
+- The heartbeat target URL is configurable. The Rust SOCKS probe accepts any
+  2xx response and supports `https://` with TLS inside the SOCKS tunnel.
+- `switchConfig` (formerly `urltest`) works with TCP-ping candidate checks.
+  XRAYDELAY, PASSIVE, measuring candidates through the protocol, and the
+  tethering switch are gated with explanations (see the support list above).
+- The Rust build has no per-flow owner check, so the 1.6.4 protection against
+  excluded apps binding to `tun0` does not apply. The UI and the service log say so.
+
+Verification for this update:
+
+- 129 Flutter tests passed in each build mode; analysis has only the three
+  existing `onReorder` deprecation infos.
+- Host tests of the pinned 0.7.0 source: `xray-config` 391 passed; TUN tests
+  in `xray-tun` 27 passed and `xray-core-rs` 264 passed (4 Hysteria/WireGuard
+  tests need a reference server and were ignored), including the new FIN and
+  stalled-upload regressions.
+- 1,380 Rust configs exported through the production builder (30 profile
+  variants of the supported transports, security, Vision, xHTTP modes and
+  certificate pins; 5 routing modes; 24 DNS variants; 9 fingerprints) were
+  each checked with `xray-rust config check`, both as built and with Android's
+  server-address resolution applied. All were accepted except REALITY with the
+  `android` fingerprint, which has no X25519 key share. That fingerprint cannot
+  complete REALITY in the Go core either.
+- On the API 36 emulator, all 10 VLESS interoperability combinations passed
+  again against Xray-core 26.7.28, and all 6 GeoIP/GeoSite tests passed.
+- Release APKs keep the rust.5 signing certificate, raise the version code
+  (12609/14609), pass 16 KiB alignment checks, and package exactly the newly
+  built core (compared after symbol stripping). The Go build still produces
+  all three ABIs.
+- Installing over rust.5 kept an imported profile and an app-data marker.
+  Through the installed release APK's TUN, a different UID (shell, 2000)
+  downloaded and SHA-256-verified 8 MiB over xHTTP/TLS, then 8 MiB more with
+  a client half-close, then 8 MiB over xHTTP/REALITY. The heartbeat probe went
+  through the tunnel. Disconnecting through the UI removed `tun0`. The fixture
+  used a local reference server and generated test credentials.
 
 ## Core update (1.6.3-rust.5)
 
@@ -230,7 +303,7 @@ remain to be measured; the emulator result is a functional smoke test.
 
 Import a VLESS share link in the app, approve the Android VPN request, and test
 web browsing, DNS/UDP, screen-off resume, reconnect and disconnect. In the
-diagnostic snapshot, `engine` must be `xray-rust 0.6.1+geo.1` and `tunBackend` must be
+diagnostic snapshot, `engine` must be `xray-rust 0.7.0` and `tunBackend` must be
 `fd`; incoming and outgoing packet counters should increase with app traffic.
 
 Compare energy against the original app on the same phone, server, network and
@@ -239,6 +312,7 @@ workload. Desktop/emulator tests cannot establish a battery-life improvement.
 ## Dependencies
 
 - [xray-rust source](https://github.com/aimalygin/xray-rust), MPL-2.0.
-- [Pinned source](https://github.com/aimalygin/xray-rust/tree/ed5258a3a589c2a1f9330142f37c8f3d28a640fa), with [local budget patch](third_party/xray-rust/geo-budgets.patch).
+- [Pinned source v0.7.0](https://github.com/aimalygin/xray-rust/tree/67969094b352f948c6b8b9e2ac75402c577cb7f7), unmodified;
+  [third-party notices](third_party/xray-rust/THIRD_PARTY_NOTICES.md), including the vendored GotaTun WireGuard engine.
 - [Bundled geodata snapshot](https://github.com/Loyalsoldier/v2ray-rules-dat/releases/tag/202609082347).
 - Upstream TeapodStream retains its existing license.
