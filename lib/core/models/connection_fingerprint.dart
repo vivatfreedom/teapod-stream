@@ -17,6 +17,7 @@ String connectionFingerprint(AppSettings s) {
     'blockQuic': s.blockQuic,
     'mtu': s.mtu,
     'ipv6Enabled': s.ipv6Enabled,
+    'allowTethering': s.allowTethering,
     'tlsFingerprint': s.tlsFingerprint.name,
     'obsProbeIntervalSec': s.obsProbeIntervalSec,
     'logLevel': s.logLevel.name,
@@ -36,9 +37,11 @@ String connectionFingerprint(AppSettings s) {
     'fragment': s.fragment.toJson(),
     'noise': s.noise.toJson(),
     'mux': s.mux.toJson(),
-    // source не влияет на активную сессию — он читается уже после срыва туннеля.
-    'heartbeatAction': s.heartbeat.action.name,
+    // switchSource не влияет на активную сессию — он читается уже после срыва.
+    'heartbeatProbe': s.heartbeat.probe.name,
+    'heartbeatAction': s.heartbeat.failAction.name,
     'heartbeatThreshold': s.heartbeat.failureThreshold,
+    'heartbeatUrl': s.heartbeat.url,
   };
   return jsonEncode(map);
 }

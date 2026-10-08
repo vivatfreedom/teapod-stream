@@ -61,9 +61,12 @@ class XrayEngine implements VpnEngine {
       'allowIcmp': options.allowIcmp,
       'blockQuic': options.blockQuic,
       'ipv6Enabled': options.ipv6Enabled,
+      'allowTethering': options.allowTethering,
       'mtu': options.mtu,
-      'heartbeatAction': options.heartbeat.action.name,
+      'heartbeatProbe': options.heartbeat.probe.name,
+      'heartbeatAction': options.heartbeat.failAction.name,
       'heartbeatThreshold': options.heartbeat.failureThreshold,
+      'heartbeatUrl': options.heartbeat.url,
       if (config.ssPrefix != null) 'ssPrefix': config.ssPrefix,
     });
   }
@@ -71,6 +74,22 @@ class XrayEngine implements VpnEngine {
   @override
   Future<void> disconnect() async {
     await _channel.invokeMethod('disconnect');
+  }
+
+  /// Замер задержки через кандидата: временный xray-инстанс с его конфигом
+  /// (`Teapodcore.measureOutboundDelay`). null — сервер не ответил.
+  Future<int?> measureOutbound(VpnConfig config, VpnEngineOptions options, String url) async {
+    try {
+      final xrayConfig = config.rawXrayConfig != null
+          ? XrayConfigBuilder.mergeWithRaw(config.rawXrayConfig!, options)
+          : XrayConfigBuilder.buildJson(config, options);
+      return await _channel.invokeMethod<int>('measureOutbound', {
+        'config': xrayConfig,
+        'url': url,
+      });
+    } catch (_) {
+      return null;
+    }
   }
 
   @override

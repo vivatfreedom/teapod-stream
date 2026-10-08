@@ -77,8 +77,11 @@ class MainActivity : FlutterActivity() {
                         val allowIcmp = call.argument<Boolean>("allowIcmp") ?: true
                         val blockQuic = call.argument<Boolean>("blockQuic") ?: false
                         val ipv6Enabled = call.argument<Boolean>("ipv6Enabled") ?: false
+                        val allowTethering = call.argument<Boolean>("allowTethering") ?: false
+                        val heartbeatProbe = call.argument<String>("heartbeatProbe") ?: "socks"
                         val heartbeatAction = call.argument<String>("heartbeatAction") ?: "reconnect"
                         val heartbeatThreshold = call.argument<Int>("heartbeatThreshold") ?: 3
+                        val heartbeatUrl = call.argument<String>("heartbeatUrl") ?: ""
 
                         if (proxyOnly) {
                             // Proxy-only: no TUN tunnel, no VPN permission needed
@@ -87,8 +90,9 @@ class MainActivity : FlutterActivity() {
                                 excludedPackages, includedPackages, vpnMode,
                                 ssPrefix, proxyOnly = true, showNotification = showNotification,
                                 killSwitch = killSwitch, allowIcmp = allowIcmp,
-                                blockQuic = blockQuic, ipv6Enabled = ipv6Enabled,
-                                heartbeatAction = heartbeatAction, heartbeatThreshold = heartbeatThreshold
+                                blockQuic = blockQuic, ipv6Enabled = ipv6Enabled, allowTethering = allowTethering,
+                                heartbeatProbe = heartbeatProbe, heartbeatAction = heartbeatAction,
+                                heartbeatThreshold = heartbeatThreshold, heartbeatUrl = heartbeatUrl
                             )
                             result.success(null)
                         } else {
@@ -98,8 +102,9 @@ class MainActivity : FlutterActivity() {
                                     excludedPackages, includedPackages, vpnMode,
                                     ssPrefix, proxyOnly = false, showNotification = showNotification,
                                     killSwitch = killSwitch, allowIcmp = allowIcmp,
-                                    blockQuic = blockQuic, ipv6Enabled = ipv6Enabled,
-                                    heartbeatAction = heartbeatAction, heartbeatThreshold = heartbeatThreshold
+                                    blockQuic = blockQuic, ipv6Enabled = ipv6Enabled, allowTethering = allowTethering,
+                                    heartbeatProbe = heartbeatProbe, heartbeatAction = heartbeatAction,
+                                    heartbeatThreshold = heartbeatThreshold, heartbeatUrl = heartbeatUrl
                                 )
                                 result.success(null)
                             }
@@ -153,6 +158,22 @@ class MainActivity : FlutterActivity() {
                         Thread {
                             val latency = pingHost(address, port)
                             runOnUiThread { result.success(latency) }
+                        }.start()
+                    }
+
+                    // Реальный замер задержки через кандидата: поднимает временный
+                    // xray-инстанс с его конфигом. В отличие от TCP-пинга видит,
+                    // что сервер жив на уровне протокола, а не только слушает порт.
+                    "measureOutbound" -> {
+                        val config = call.argument<String>("config") ?: ""
+                        val url = call.argument<String>("url") ?: ""
+                        Thread {
+                            val latency = try {
+                                teapodcore.Teapodcore.measureOutboundDelay(config, url)
+                            } catch (e: Exception) {
+                                -1L
+                            }
+                            runOnUiThread { result.success(if (latency >= 0) latency.toInt() else null) }
                         }.start()
                     }
 
@@ -375,8 +396,11 @@ class MainActivity : FlutterActivity() {
         allowIcmp: Boolean = false,
         blockQuic: Boolean = false,
         ipv6Enabled: Boolean = false,
+        allowTethering: Boolean = false,
+        heartbeatProbe: String = "socks",
         heartbeatAction: String = "reconnect",
         heartbeatThreshold: Int = 3,
+        heartbeatUrl: String = "",
     ) {
         requestBatteryOptimizationExemption()
         val intent = Intent(this, XrayVpnService::class.java).apply {
@@ -395,8 +419,11 @@ class MainActivity : FlutterActivity() {
             putExtra(XrayVpnService.EXTRA_ALLOW_ICMP, allowIcmp)
             putExtra(XrayVpnService.EXTRA_BLOCK_QUIC, blockQuic)
             putExtra(XrayVpnService.EXTRA_IPV6, ipv6Enabled)
+            putExtra(XrayVpnService.EXTRA_ALLOW_TETHERING, allowTethering)
+            putExtra(XrayVpnService.EXTRA_HEARTBEAT_PROBE, heartbeatProbe)
             putExtra(XrayVpnService.EXTRA_HEARTBEAT_ACTION, heartbeatAction)
             putExtra(XrayVpnService.EXTRA_HEARTBEAT_THRESHOLD, heartbeatThreshold)
+            putExtra(XrayVpnService.EXTRA_HEARTBEAT_URL, heartbeatUrl)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
