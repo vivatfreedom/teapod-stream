@@ -5,7 +5,7 @@ The default build uses Go/teapod-core. The separate Rust build uses
 Rust application ID: `com.teapodstream.rustprobe`. It installs alongside the original TeapodStream.
 No live VPN profile or credentials are bundled.
 
-## Rust support (1.6.6-rust.6)
+## Rust support (1.6.6-rust.7)
 
 - VLESS with `encryption=none` over TCP/RAW, WebSocket, HTTPUpgrade, gRPC,
   XHTTP/SplitHTTP. TLS is supported on all these carriers; REALITY on TCP/RAW,
@@ -18,11 +18,35 @@ No live VPN profile or credentials are bundled.
   passed the same payload test. No transport/crypto patch is applied here.
 - TLS certificate verification remains enabled. `pinSHA256` accepts SHA-256 of
   the full DER certificate as hex (including colon-separated hex) or base64;
-  the Rust config uses `pinnedPeerCertSha256`. `allowInsecure` and ECH are rejected.
+  the Rust config uses `pinnedPeerCertSha256`. `allowInsecure` without a pin and
+  ECH are rejected.
 - XHTTP `auto` / `packet-up` / `stream-up` / `stream-one`, host/path/extra,
   REALITY SNI, fingerprint, public key, short ID and spiderX.
-- Direct TUN, TCP/UDP, DNS through the proxy, Android per-app inclusion/exclusion,
-  existing reconnect and TUN-sink kill-switch paths.
+- Hysteria 2 (`hy2://`, `hysteria2://`) without Salamander or port hopping; see
+  [Hysteria 2 in the Rust build](#hysteria-2-in-the-rust-build-166-rust7).
+- Direct TUN, TCP/UDP, Android per-app inclusion/exclusion, existing reconnect
+  and TUN-sink kill-switch paths.
+- DNS through the VPN or direct. App queries always go to the core's DNS
+  outbound, which answers A/AAAA through the DNS module with the selected
+  server (other query types get an empty NOERROR). In direct mode the module
+  (`dns-module`) is routed to `direct`: the selected server is queried outside
+  the tunnel through protected sockets, for app lookups and for the core's own
+  (IP rules, direct destinations). Go instead forwards port 53 to 1.1.1.1 and
+  resolves through `localhost`; xray-rust reads `localhost` as a server named
+  localhost:53, and the StaticOnly bootstrap has no system resolver. A custom
+  DNS server given by name is resolved by Android into `dns.hosts` before TUN
+  starts (presets carry their IP); without it StaticOnly returns SERVFAIL.
+- Ad blocking: the DNS outbound answers `geosite:category-ads-all` and
+  `geosite:win-spy` (Go's list) with an empty NOERROR, as Go's
+  `rcode://success` server does, which xray-rust rejects. It applies with
+  FakeDNS and in direct DNS mode too; Go's direct mode skips ad blocking.
+  xray-rust 0.7.0 caps a config at 250,000 domain matchers shared by routing
+  and DNS-outbound rules, and ad blocking alone expands to about 187k
+  (category-ads-all 186,402 + win-spy 327 in the bundled snapshot). Ad blocking
+  together with a GeoSite rule on `cn`, `china-list` (about 111k each) or
+  `category-ads-all` is therefore rejected before VPN startup. category-ads-all
+  is also at 93% of the core's per-category cap of 200,000 entries: a
+  Loyalsoldier update growing it by about 7% would stop every ad-blocking start.
 - App selection is enforced only by Android's VPN UID ranges. The Rust core has
   no per-flow owner check like Go's tun2socks validator, so in both split-tunnel
   modes an app outside the VPN that binds a socket to `tun0` (SO_BINDTODEVICE,
@@ -35,29 +59,107 @@ No live VPN profile or credentials are bundled.
   validated through Rust before an atomic pointer selects it; failure retains
   the prior pair. Reconnect VPN to apply new rules or databases.
 - Domain routing enables bounded FakeDNS automatically (4096 addresses, 300-second
-  leases) to retain domain identity through TUN. Keep DNS through VPN and domain
-  detection enabled. Applications using their own encrypted DNS or cached real IPs
+  leases) to retain domain identity through TUN. Keep domain detection enabled.
+  Apps then get FakeDNS answers in both DNS modes; direct mode applies to the
+  core's own lookups. Applications using their own encrypted DNS or cached real IPs
   may evade GeoSite matching; turn off their secure-DNS override and restart them
   after changing routing. FakeDNS returns IPv4 and suppresses AAAA in this mode.
-- Ad blocking remains unsupported in this build.
-- Heartbeat uses the SOCKS probe only. Custom `http://` and `https://` targets
-  work; HTTPS runs TLS with certificate and hostname checks inside the SOCKS
-  tunnel. Go's XRAYDELAY (in-core measurement) and PASSIVE (relies on the
-  tun2socks stall watchdog) are gated; a stored unsupported probe is sent as SOCKS.
+- Heartbeat: the SOCKS probe (custom `http://` and `https://` targets; HTTPS
+  runs TLS with certificate and hostname checks inside the SOCKS tunnel) and
+  PASSIVE. Liveness uses the core's live TUN counters: data counts as received
+  only when TCP/UDP remote read bytes grow, not when the core writes its own
+  DNS/FakeDNS answers, ICMP replies or TCP control packets. As in Go, an exited
+  TUN fd read/write loop reconnects, and the TUN stall watchdog runs the failure
+  action after 120 s without received data while at least 2 TUN flows are open.
+  For the watchdog only, TCP payload the outbound accepted also counts as
+  activity: xray-rust ACKs an app's upload locally, while Go's tun2socks
+  refreshes on every TUN write (including those ACKs), so a reply-less upload
+  over 2 minutes (HTTP/1.1 PUT, FTP STOR) would otherwise reconnect. UDP sends
+  never block and do not count; the probe-skip freshness check stays read-only.
+  PASSIVE runs only these checks, with no probe in the loop or on screen wake.
+  XRAYDELAY (in-core measurement) is gated and a stored XRAYDELAY is sent as SOCKS.
 - When failed heartbeats switch configurations, Rust checks candidates with a
   TCP ping and considers only profiles it supports; Go measures them through a
   temporary core instance.
 
 The Rust build requires MTU 1500, UDP enabled and QUIC blocking disabled.
-Proxy-only mode, raw Xray JSON, legacy mux, fragmentation/noise and other proxy
-protocols are rejected with an error before VPN startup. ICMP handling is the
-Rust core's local synthetic behavior; it is not a remote ping measurement.
+Proxy-only mode, raw Xray JSON, legacy mux and fragmentation (VLESS), noise and
+other proxy protocols are rejected with an error before VPN startup. ICMP
+handling is the Rust core's local synthetic behavior; it is not a remote ping
+measurement.
 
-Packet path: Android TUN → Rust userspace stack → VLESS/XHTTP/REALITY.
+Packet path: Android TUN → Rust userspace stack → VLESS/XHTTP/REALITY or Hysteria 2.
 A no-auth SOCKS listener on `127.0.0.1` supports the app's heartbeat and IP check.
 Device TUN traffic does not traverse this listener. SOCKS credentials settings
-do not apply to this experimental build. Traffic counters report core payload
-accounting, rather than the original tun2socks IP-byte counters.
+do not apply to this experimental build. Speed and totals come from the core's
+live TUN payload counters (bytes written to and read from outbounds, proxy and
+direct), not tun2socks IP-byte counters; the per-outbound snapshot in the
+diagnostics counts closed connections only.
+
+## Hysteria 2 in the Rust build (1.6.6-rust.7)
+
+- `hy2://` / `hysteria2://` profiles run on the core's Hysteria 2 client:
+  `protocol: hysteria`, stock QUIC TLS with ALPN `h3`, password auth (1–4096
+  bytes, no control characters), default BBR. The core keeps one QUIC
+  connection per server with fixed budgets of 64 concurrent TCP streams and
+  32 UDP sessions for the whole device: a further connection fails at once
+  until one closes. UDP is carried in 1200-byte QUIC datagrams and fragmented
+  above that.
+- Rejected before VPN startup with an explanation: Salamander `obfs`, port
+  hopping (a port range/list or `mport`), Brutal/bandwidth and other QUIC
+  overrides, and noise (it needs `sockopt.dialerProxy`). Mux and fragmentation
+  do not apply to Hysteria 2 in either build and do not block it.
+- `pinSHA256` (hex, colon-hex or base64 of the leaf certificate's SHA-256) is
+  written as hex `pinnedPeerCertSha256` by both builders: it is also the only
+  pin key of Xray-core `1aabe7ea` (teapod-core 1.1.15), which silently ignored
+  the earlier Go `pinnedPeerCertificateChainSha256` key (this fix applies to
+  both builds). TLS fingerprint and ALPN overrides are dropped, as QUIC TLS is
+  not shaped.
+- A certificate pin wins over `allowInsecure` (`insecure=1`), for Hysteria 2
+  and VLESS TLS, in both builds: such a profile is built with
+  `allowInsecure: false` and the pin, so only the pinned certificate is
+  accepted (Xray-core `1aabe7ea` refuses `allowInsecure: true` outright). Rust
+  still rejects `allowInsecure` without a pin.
+- Routing, FakeDNS and DNS are the same as for VLESS; domain destinations are
+  passed to the server. Android resolves every VLESS `vnext` and Hysteria
+  server name into `dns.hosts` before TUN starts, under one 5-second budget;
+  IP-literal servers are used as is.
+- Share links: `host:port/?…` keeps its port. A port range or list
+  (`20000-30000`, `443,5000-6000`) or `mport` keeps the first port in `port`
+  and the specification in `hopPorts`, instead of silently becoming 443 (this
+  parser fix applies to both builds). An unreadable `mport` (for example
+  sing-box's `20000:30000`) is ignored when the link's own port is valid, as
+  before, so such a profile still imports with that port. The Go build passes it to Xray-core as
+  `finalmask.quicParams.udpHop.ports` (format checked against Xray-core
+  `1aabe7ea` used by teapod-core 1.1.15 and v26.7.28).
+- `scripts/test-rust-transports.py` adds two Hysteria 2 cases (pin, and
+  `insecure=1` + pin) against the pinned Xray 26.7.28 `hysteria` inbound, each
+  with TCP, inner-TLS and SOCKS UDP echo (64/1000/3000 bytes);
+  `TEAPOD_INTEROP_HYSTERIA_ONLY=1` runs only them.
+
+Verification for 1.6.6-rust.7:
+
+- 152 Flutter tests passed in each build mode; analysis has only the three
+  existing `onReorder` deprecation infos.
+- Rust configs exported through the production builder were accepted by
+  `xray-rust config check` across Hysteria 2 and VLESS profiles, routing modes,
+  DNS presets, direct/proxy DNS and ad blocking; the expected Hysteria 2
+  rejections (Salamander, port hopping, Go pin key, `allowInsecure` without a
+  pin) were confirmed against the core. On the host, ad-blocked domains got an
+  empty NOERROR and direct DNS resolved outside the tunnel.
+- On the API 36 emulator: all 10 VLESS combinations and both Hysteria 2 cases
+  (TCP, inner TLS and SOCKS UDP echo) against Xray-core 26.7.28; the 6
+  GeoIP/GeoSite tests and the new TUN counter test.
+- The release APK installed over rust.6 kept its profile. Through the installed
+  APK's TUN, a different UID (shell, 2000) downloaded and SHA-256-verified
+  64 MiB over xHTTP/TLS, and 8 MiB plus 64 MiB over Hysteria 2. During the
+  64 MiB transfer the home screen totals grew live (29.6 → 58.6 → 64.0 MB).
+  Disconnecting through the UI removed `tun0`.
+- Release APKs keep the rust.4–rust.6 signing certificate, raise the version
+  code (12610/14610), pass 16 KiB alignment checks and package the same
+  xray-rust 0.7.0 core as rust.6.
+- Not covered by these tests: heavy browsing against the 64-stream Hysteria 2
+  limit, screen-off soak for the stall watchdog, and PASSIVE on a phone.
 
 ## Build selection and feature flags
 
@@ -87,7 +189,7 @@ For direct Flutter commands, prepare dependencies first:
 ./build-rust.sh binaries
 flutter build apk --release --dart-define=TEAPOD_CORE=rust \
   --target-platform android-arm64,android-x64 --split-per-abi \
-  --build-name=1.6.6-rust.6 --build-number=10609
+  --build-name=1.6.6-rust.7 --build-number=10610
 
 # Native Android binding tests use the same base64-encoded Flutter flag.
 cd android
