@@ -309,11 +309,33 @@ class VlessParser {
       final hostPart = main.substring(atIdx + 1);
 
       final qIdx = hostPart.indexOf('?');
-      final hostPort = qIdx >= 0 ? hostPart.substring(0, qIdx) : hostPart;
+      var hostPort = qIdx >= 0 ? hostPart.substring(0, qIdx) : hostPart;
       final queryStr = qIdx >= 0 ? hostPart.substring(qIdx + 1) : '';
+      // Официальный формат ссылки — `host:port/?…`: путь в порт не входит.
+      final slashIdx = hostPort.indexOf('/');
+      if (slashIdx >= 0) hostPort = hostPort.substring(0, slashIdx);
 
-      final (host, port) = _parseHostPort(hostPort, 443);
+      final (host, portSpec) = _splitHostPortSpec(hostPort);
       final params = Uri.splitQueryString(queryStr);
+      // Port hopping: диапазон/список вместо порта (`20000-30000`,
+      // `443,5000-6000`) или `mport` из v2rayN. Нераспознанный порт — ошибка
+      // импорта, а не тихие 443: с чужим портом профиль просто не подключится.
+      final ports = _parsePortSpec(portSpec, 443);
+      if (ports == null) return null;
+      final port = ports.$1;
+      var hopPorts = ports.$2;
+      final mport = params['mport']?.trim() ?? '';
+      if (hopPorts == null && mport.isNotEmpty) {
+        final hop = _parsePortSpec(mport, port);
+        // Нераспознанный mport (`20000:30000` из sing-box, мусор) ссылку не
+        // ломает: основной порт валиден, подключаемся к нему без hopping.
+        if (hop != null &&
+            hop.$1 >= 1 &&
+            hop.$1 <= 65535 &&
+            (hop.$2 != null || hop.$1 != port)) {
+          hopPorts = hop.$2 ?? '${hop.$1}';
+        }
+      }
 
       final obfs = params['obfs'];
       final obfsPassword =
@@ -335,6 +357,7 @@ class VlessParser {
         pinSHA256: pinSHA256,
         sni: params['sni'],
         obfsPassword: obfsPassword,
+        hopPorts: hopPorts,
         createdAt: DateTime.now(),
         rawUri: uri,
       );
@@ -364,6 +387,45 @@ class VlessParser {
     final host = hostPort.substring(0, colonIdx);
     final port = int.tryParse(hostPort.substring(colonIdx + 1)) ?? defaultPort;
     return (host, port);
+  }
+
+  /// Хост и сырая строка порта; IPv6 — в квадратных скобках.
+  static (String, String) _splitHostPortSpec(String hostPort) {
+    if (hostPort.startsWith('[')) {
+      final closeBracket = hostPort.indexOf(']');
+      final rest = hostPort.substring(closeBracket + 1);
+      return (
+        hostPort.substring(1, closeBracket),
+        rest.startsWith(':') ? rest.substring(1) : '',
+      );
+    }
+    final colonIdx = hostPort.lastIndexOf(':');
+    if (colonIdx < 0) return (hostPort, '');
+    return (hostPort.substring(0, colonIdx), hostPort.substring(colonIdx + 1));
+  }
+
+  static final _portRange = RegExp(r'^(\d{1,5})(?:-(\d{1,5}))?$');
+
+  /// Порт Hysteria2: одно число или список портов/диапазонов для port
+  /// hopping. Возвращает первый порт и нормализованный список (null, если
+  /// порт один); null — строка не разобрана. Пустая строка — [defaultPort].
+  static (int, String?)? _parsePortSpec(String spec, int defaultPort) {
+    final trimmed = spec.replaceAll(' ', '');
+    if (trimmed.isEmpty) return (defaultPort, null);
+    final single = int.tryParse(trimmed);
+    // Границы одиночного порта проверяет VpnConfig.validate().
+    if (single != null) return (single, null);
+    final parts = trimmed.split(',');
+    int? first;
+    for (final part in parts) {
+      final match = _portRange.firstMatch(part);
+      if (match == null) return null;
+      final from = int.parse(match[1]!);
+      final to = match[2] == null ? from : int.parse(match[2]!);
+      if (from < 1 || to > 65535 || from > to) return null;
+      first ??= from;
+    }
+    return (first!, parts.join(','));
   }
 
   static VpnSecurity _parseSecurity(String s) {

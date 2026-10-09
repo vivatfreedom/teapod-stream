@@ -113,6 +113,69 @@ void main() {
         const uri = 'hysteria2://pass@host:443';
         expect(VlessParser.parseUri(uri)?.protocol, VpnProtocol.hysteria2);
       });
+
+      test('official host:port/?query form keeps a non-default port', () {
+        final config = VlessParser.parseUri(
+          'hysteria2://pass@server.com:8443/?sni=cover.example#HY2',
+        )!;
+        expect(config.port, 8443);
+        expect(config.hopPorts, isNull);
+        expect(config.sni, 'cover.example');
+        expect(config.name, 'HY2');
+      });
+
+      test('port range or list keeps the first port and the hop spec', () {
+        final cases = {
+          'hy2://pass@server.com:20000-30000/?sni=s': (20000, '20000-30000'),
+          'hy2://pass@server.com:443,5000-6000?sni=s': (443, '443,5000-6000'),
+          'hy2://pass@[2001:db8::1]:20000-20010/?sni=s': (20000, '20000-20010'),
+          'hy2://pass@server.com:443?mport=20000-30000': (443, '20000-30000'),
+          'hy2://pass@server.com:443?mport=8443': (443, '8443'),
+        };
+        for (final entry in cases.entries) {
+          final config = VlessParser.parseUri(entry.key);
+          expect(config, isNotNull, reason: entry.key);
+          expect(config!.port, entry.value.$1, reason: entry.key);
+          expect(config.hopPorts, entry.value.$2, reason: entry.key);
+          expect(config.validate(), isNull, reason: entry.key);
+        }
+        expect(
+          VlessParser.parseUri('hy2://pass@[2001:db8::1]:20000-20010')!.address,
+          '2001:db8::1',
+        );
+        // An mport equal to the only port is not hopping.
+        expect(
+          VlessParser.parseUri('hy2://pass@server.com:443?mport=443')!.hopPorts,
+          isNull,
+        );
+      });
+
+      test('an unreadable port is rejected instead of becoming 443', () {
+        for (final uri in [
+          'hy2://pass@server.com:30000-20000',
+          'hy2://pass@server.com:0-10',
+          'hy2://pass@server.com:443-70000',
+          'hy2://pass@server.com:abc',
+          'hy2://pass@server.com:443,',
+        ]) {
+          expect(VlessParser.parseUri(uri), isNull, reason: uri);
+        }
+      });
+
+      test('an unreadable mport is ignored when the main port is valid', () {
+        for (final uri in [
+          'hy2://pass@server.com:443?mport=x-y',
+          'hy2://pass@server.com:443?mport=70000',
+          'hy2://pass@server.com:443?mport=20000:30000&sni=s',
+          'hy2://pass@server.com:443?mport=30000-20000',
+        ]) {
+          final config = VlessParser.parseUri(uri);
+          expect(config, isNotNull, reason: uri);
+          expect(config!.port, 443, reason: uri);
+          expect(config.hopPorts, isNull, reason: uri);
+          expect(config.validate(), isNull, reason: uri);
+        }
+      });
     });
 
     group('Unknown scheme', () {
