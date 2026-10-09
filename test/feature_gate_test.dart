@@ -67,9 +67,9 @@ void main() {
         home: Scaffold(
           body: FeatureGate(
             features: CoreFeatures.rust,
-            feature: CoreFeature.adBlocking,
+            feature: CoreFeature.quicBlocking,
             onReset: () => reset = true,
-            child: const Text('Ad blocking: on'),
+            child: const Text('QUIC blocking: on'),
           ),
         ),
       ),
@@ -134,10 +134,10 @@ void main() {
     expect(find.text('Сбросить неподдерживаемое значение'), findsNothing);
   });
 
-  testWidgets('a stored PASSIVE probe is shown in Rust with a reset to SOCKS', (
+  testWidgets('a stored XRAYDELAY probe is shown in Rust with a reset to SOCKS', (
     tester,
   ) async {
-    var probe = HeartbeatProbe.passive;
+    var probe = HeartbeatProbe.xrayDelay;
     final feature = CoreFeatures.heartbeatProbeFeature(probe)!;
     await tester.pumpWidget(
       MaterialApp(
@@ -151,12 +151,39 @@ void main() {
         ),
       ),
     );
-    expect(find.text('PASSIVE'), findsOneWidget);
+    expect(find.text('XRAYDELAY'), findsOneWidget);
     expect(
       find.text(CoreFeatures.rust.unavailableReason(feature)!),
       findsOneWidget,
     );
     await tester.tap(find.text('Сбросить неподдерживаемое значение'));
     expect(probe, HeartbeatProbe.socks);
+  });
+
+  testWidgets('PASSIVE stays an ordinary interactive value in both cores', (
+    tester,
+  ) async {
+    final feature = CoreFeatures.heartbeatProbeFeature(HeartbeatProbe.passive)!;
+    for (final features in [CoreFeatures.go, CoreFeatures.rust]) {
+      var tapped = false;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: FeatureGate(
+              features: features,
+              feature: feature,
+              onReset: () {},
+              child: TextButton(
+                onPressed: () => tapped = true,
+                child: const Text('PASSIVE'),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('PASSIVE'));
+      expect(tapped, isTrue);
+      expect(find.text('Сбросить неподдерживаемое значение'), findsNothing);
+    }
   });
 }

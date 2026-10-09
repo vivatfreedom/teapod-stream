@@ -90,9 +90,12 @@ void main() {
           ),
         ),
       );
+      // Rust has no in-core delay measurement; PASSIVE uses its TUN counters.
       expect(
         sent!['heartbeatProbe'],
-        CoreFeatures.current.isRust ? 'socks' : probe.name,
+        CoreFeatures.current.isRust && probe == HeartbeatProbe.xrayDelay
+            ? 'socks'
+            : probe.name,
       );
       expect(sent!['allowTethering'], !CoreFeatures.current.isRust);
       // Rust's SOCKS probe supports HTTPS targets and switchConfig too.

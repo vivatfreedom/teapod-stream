@@ -48,14 +48,11 @@ class CoreFeatures {
     CoreFeature.fragmentation,
     CoreFeature.noise,
     CoreFeature.mux,
-    CoreFeature.directDns,
-    CoreFeature.adBlocking,
     CoreFeature.upstreamUpdates,
     CoreFeature.observatory,
     CoreFeature.rawConfig,
     CoreFeature.visionWithTls,
     CoreFeature.coreDelayProbe,
-    CoreFeature.passiveHeartbeat,
     CoreFeature.tetheringControl,
     CoreFeature.outboundDelayProbe,
   };
@@ -97,7 +94,10 @@ class CoreFeatures {
         'Vision поверх TLS пока недоступен: в текущем Rust-ядре обрывается передача после перехода в direct mode. Используй TCP + Reality + Vision.',
       CoreFeature.geoip ||
       CoreFeature.geosite ||
-      CoreFeature.appRouting => null,
+      CoreFeature.appRouting ||
+      CoreFeature.directDns ||
+      CoreFeature.adBlocking ||
+      CoreFeature.passiveHeartbeat => null,
       CoreFeature.socksAuthentication =>
         'Rust: локальный SOCKS работает без логина и пароля.',
       CoreFeature.proxyOnly => 'Rust: доступен режим VPN через TUN.',
@@ -111,19 +111,14 @@ class CoreFeatures {
         'Фрагментация пока недоступна в Rust-сборке.',
       CoreFeature.noise => 'Шумы пока недоступны в Rust-сборке.',
       CoreFeature.mux => 'Mux пока недоступен в Rust-сборке.',
-      CoreFeature.directDns => 'Rust: DNS должен идти через VPN.',
-      CoreFeature.adBlocking =>
-        'Блокировка рекламы пока недоступна в Rust-сборке.',
       CoreFeature.upstreamUpdates =>
         'Rust-сборка обновляется вручную из форка.',
       CoreFeature.observatory =>
         'Rust: управляемые JSON-конфиги и Observatory пока недоступны.',
       CoreFeature.rawConfig =>
-        'Rust: поддерживается VLESS с TLS/Reality, включая TCP + Vision; полный JSON пока недоступен.',
+        'Rust: поддерживаются VLESS с TLS/Reality, включая TCP + Vision, и Hysteria2 без obfs и смены портов; полный JSON пока недоступен.',
       CoreFeature.coreDelayProbe =>
         'XRAYDELAY недоступен: в Rust-ядре нет встроенного замера задержки по URL, туннель проверяется SOCKS-пробой.',
-      CoreFeature.passiveHeartbeat =>
-        'PASSIVE в Go опирается на сторож зависаний tun2socks. В Rust-сборке его нет, и мёртвый туннель остался бы незамеченным, поэтому используется SOCKS-проба.',
       CoreFeature.tetheringControl =>
         'Rust-ядро не проверяет владельца потоков TUN: потоки без владельца не блокируются, и защита 1.6.4 от обхода исключений через tun0 здесь не действует.',
       CoreFeature.outboundDelayProbe =>

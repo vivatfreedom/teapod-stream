@@ -64,7 +64,7 @@ class XrayVpnService : VpnService() {
         const val EXTRA_IPV6 = "ipv6_enabled" // add IPv6 address/route to the TUN interface
         const val EXTRA_ALLOW_TETHERING = "allow_tethering" // allExcept: let unowned (tethered) flows in
         const val EXTRA_MTU = "mtu" // TUN MTU size
-        const val EXTRA_HEARTBEAT_PROBE = "heartbeat_probe"      // "socks" | "xrayDelay" | "passive" (Rust: только socks)
+        const val EXTRA_HEARTBEAT_PROBE = "heartbeat_probe"      // "socks" | "xrayDelay" | "passive" (Rust: socks | passive)
         const val EXTRA_HEARTBEAT_ACTION = "heartbeat_action"    // "reconnect" | "switchConfig" (старое имя "urltest")
         const val EXTRA_HEARTBEAT_THRESHOLD = "heartbeat_threshold" // провалов подряд до действия
         const val EXTRA_HEARTBEAT_URL = "heartbeat_url"          // куда стучится проба
@@ -76,11 +76,11 @@ class XrayVpnService : VpnService() {
         @Volatile private var tunModeActive = false
 
         @JvmStatic fun getNativeState(): String {
-            // If the native state claims "connected" but the Rust runtime has stopped,
-            // the TUN fd was likely closed externally (e.g. system network change during a phone call)
-            // without onRevoke() being called. Correct the stale state proactively so that
-            // syncNativeState() in Flutter reflects reality instead of showing a phantom connection.
-            if (currentNativeState == "connected" && tunModeActive && !RustCore.isRunning()) {
+            // If the native state claims "connected" but the Rust runtime has stopped or its TUN
+            // fd loop has exited, the TUN fd was likely closed externally (e.g. system network change
+            // during a phone call) without onRevoke() being called. Correct the stale state proactively
+            // so that syncNativeState() in Flutter reflects reality instead of showing a phantom connection.
+            if (currentNativeState == "connected" && tunModeActive && !RustCore.isTunRunning()) {
                 currentNativeState = "disconnected"
             }
             return currentNativeState
@@ -153,7 +153,9 @@ class XrayVpnService : VpnService() {
         // probes. Dead-tunnel detection grows to ~3 min while asleep — acceptable,
         // checkTunStallOnWake() probes immediately on SCREEN_ON.
         private const val HEARTBEAT_INTERVAL_SCREEN_OFF_MS = 60_000L
-        // After a long idle interval, check the upstream when the screen wakes.
+        // If no data has arrived from the network for TUN flows for this long while ≥2 flows
+        // are open, the upstream is stuck (connections held open but nothing coming back).
+        // The SOCKS5 heartbeat bypasses TUN and won't catch this. Also used on screen wake.
         private const val TUN_STALL_TIMEOUT_MS = 120_000L
         // After a reconnect xray establishes its outbound connection lazily. Probes run every
         // 15 s but failures are not counted until the first probe succeeds (warmup mode). This
@@ -246,8 +248,8 @@ class XrayVpnService : VpnService() {
     private var pendingNetworkRunnable: Runnable? = null
     private var heartbeatThread: Thread? = null
     private val heartbeatFailures = AtomicInteger(0)
-    // Чем щупаем туннель. Rust-сборка умеет только "socks" (HTTP/HTTPS через SOCKS5):
-    // другие значения сводятся к нему в applyHeartbeatProbe().
+    // Чем щупаем туннель: "socks" (HTTP/HTTPS через SOCKS5) или "passive" (только
+    // счётчики TUN, без активных проб). xrayDelay сводится к socks в applyHeartbeatProbe().
     private var heartbeatProbe: String = "socks"
     // Запрошенная, но неподдерживаемая проба — пишется в лог один раз при старте VPN.
     @Volatile private var unsupportedHeartbeatProbe: String? = null
@@ -538,7 +540,7 @@ class XrayVpnService : VpnService() {
         unsupportedHeartbeatProbe?.let {
             unsupportedHeartbeatProbe = null
             log("warning", "Heartbeat probe \"$it\" не поддерживается Rust-ядром " +
-                "(нет замера внутри ядра и метрик tun2socks), используется socks")
+                "(нет замера внутри ядра), используется socks")
         }
 
         try {
@@ -909,6 +911,7 @@ class XrayVpnService : VpnService() {
         // Idle alone isn't proof of death though — probe the upstream through xray
         // and reconnect only if it actually fails (issue #81: blind reconnects on
         // every wake). onReceive runs on the main thread, so probe off-thread.
+        if (heartbeatProbe == "passive") return
         if (!wakeProbeRunning.compareAndSet(false, true)) return
         Thread {
             try {
@@ -1208,8 +1211,8 @@ class XrayVpnService : VpnService() {
     }
 
     private fun startHeartbeat(isReconnect: Boolean = false) {
-        log("info", "startHeartbeat (isReconnect=$isReconnect)")
-        if (parseProbeUrl(heartbeatUrl) == null) {
+        log("info", "startHeartbeat (isReconnect=$isReconnect, probe=$heartbeatProbe)")
+        if (heartbeatProbe != "passive" && parseProbeUrl(heartbeatUrl) == null) {
             log("warning", "Heartbeat URL \"$heartbeatUrl\" не разобран (нужен http:// или https:// с хостом), " +
                 "проба идёт на $DEFAULT_HEARTBEAT_URL")
         }
@@ -1228,6 +1231,7 @@ class XrayVpnService : VpnService() {
             // the first probe failure should immediately trigger a reconnect.
             var noInternetStreak = 0
             var successCount = 0
+            var lastStallWarnAt = 0L
 
             while (!Thread.currentThread().isInterrupted && isRunning.get()) {
                 try {
@@ -1249,20 +1253,24 @@ class XrayVpnService : VpnService() {
                     val port = activeSocksPort
                     if (port <= 0) continue
 
-                    // Check tun2socks is alive before testing SOCKS5 connectivity.
-                    // The SOCKS5 probe bypasses TUN entirely, so it passes even if tun2socks
-                    // has crashed or its goroutines are deadlocked.
-                    // Skip in proxy-only mode: tun2socks is intentionally not started.
-                    if (tunModeActive && !RustCore.isRunning()) {
-                        log("warning", "Rust TUN not running, reconnecting")
-                        reconnectInternal()
-                        break
+                    // Check the Rust TUN data path before testing SOCKS5 connectivity.
+                    // The SOCKS5 probe bypasses TUN entirely, so it passes even if the
+                    // TUN fd loops have exited on an fd error while the runtime lives on.
+                    if (tunModeActive) {
+                        val tunFailure = RustCore.tunFailure()
+                        if (tunFailure != null) {
+                            log("warning", "Rust TUN not running ($tunFailure), reconnecting")
+                            reconnectInternal()
+                            break
+                        }
                     }
 
                     // Data reached the TUN within the last interval — the tunnel is
                     // demonstrably alive, no need to burn a radio round-trip on an
-                    // active probe. Idle tunnels still get the full SOCKS5 probe.
-                    if (!isTunRxFresh()) {
+                    // active probe. Idle tunnels still get the full probe, кроме
+                    // пассивного режима: там активных проб нет вовсе, обрыв ловят
+                    // TUN stall watchdog и проверка TUN выше (как в Go).
+                    if (heartbeatProbe != "passive" && !isTunRxFresh()) {
                         runProbe(port)
                     }
                     warmupDone = true
@@ -1270,8 +1278,8 @@ class XrayVpnService : VpnService() {
                     noInternetStreak = 0
                     successCount++
                     if (successCount % 5 == 0) {
-                        val activeConns = if (tunModeActive) RustCore.activeConnections() else 0L
-                        log("info", "Heartbeat alive (${successCount} ok, tun=${RustCore.isRunning()}, conns=$activeConns)")
+                        val activeConns = if (tunModeActive) RustCore.tunActiveFlows() else 0L
+                        log("info", "Heartbeat alive (${successCount} ok, tun=${RustCore.isTunRunning()}, conns=$activeConns)")
                     }
                     // Log detailed tunnel stats every ~1 minute for diagnostics.
                     // Route the Rust diagnostic snapshot to
@@ -1282,6 +1290,31 @@ class XrayVpnService : VpnService() {
                             val lastRx = RustCore.lastRxActivityMs()
                             val lastRxSec = if (lastRx > 0) (System.currentTimeMillis() - lastRx) / 1000 else -1
                             log("debug", "tun stats: $stats lastRxSec=$lastRxSec")
+                        }
+                    }
+                    // Detect TUN-layer stall: SOCKS5 heartbeat bypasses TUN entirely,
+                    // so it passes even when flows are open but nothing comes back from
+                    // the network (e.g. connections half-open, held by keepalives).
+                    // Same thresholds as Go; activity is remote read bytes or accepted
+                    // TCP upload bytes (a reply-less upload is not a stall).
+                    if (tunModeActive) {
+                        val lastRx = RustCore.lastTunActivityMs()
+                        if (lastRx > 0) {
+                            val now = System.currentTimeMillis()
+                            val idleSec = (now - lastRx) / 1000
+                            val activeConns by lazy { RustCore.tunActiveFlows() }
+                            when {
+                                idleSec >= TUN_STALL_TIMEOUT_MS / 1000 && activeConns >= 2 -> {
+                                    if (handleHeartbeatExhausted(
+                                            heartbeatThreshold,
+                                            "TUN stall: no data for ${idleSec}s (conns=$activeConns)")
+                                    ) continue else break
+                                }
+                                idleSec >= 60 && activeConns >= 2 && now - lastStallWarnAt >= 60_000 -> {
+                                    log("warning", "TUN rx idle for ${idleSec}s (conns=$activeConns)")
+                                    lastStallWarnAt = now
+                                }
+                            }
                         }
                     }
                 } catch (_: InterruptedException) {
@@ -1343,8 +1376,8 @@ class XrayVpnService : VpnService() {
         }.also { it.isDaemon = true; it.start() }
     }
 
-    // True when tun2socks wrote data to the TUN within the last heartbeat interval —
-    // the tunnel is demonstrably passing traffic even if the probe itself fails.
+    // True when TUN flows received data from the network within the last heartbeat
+    // interval — the tunnel is demonstrably passing traffic even if the probe fails.
     private fun isTunRxFresh(): Boolean {
         if (!tunModeActive) return false
         val lastRx = RustCore.lastRxActivityMs()
@@ -1358,13 +1391,13 @@ class XrayVpnService : VpnService() {
         heartbeatFailures.set(0)
     }
 
-    /// Rust-ядро умеет только socks-пробу: замера внутри ядра (xrayDelay) у xray-rust
-    /// нет, а passive опирается на метрики и stall watchdog tun2socks, которых в
-    /// Rust-сервисе нет — без активных проб мёртвый туннель остался бы незамеченным.
-    /// Dart в Rust-сборке шлёт только "socks"; остальное сводим к нему и пишем в лог.
+    /// Rust-ядро умеет socks и passive. Замера внутри ядра (xrayDelay) у xray-rust нет;
+    /// passive, как в Go, держится на проверке TUN и stall watchdog по счётчикам ядра.
+    /// Dart в Rust-сборке xrayDelay не шлёт; если он пришёл (старые ConnectionParams),
+    /// сводим к socks и пишем в лог.
     private fun applyHeartbeatProbe(requested: String?) {
-        heartbeatProbe = "socks"
-        unsupportedHeartbeatProbe = requested?.takeIf { it.isNotEmpty() && it != "socks" }
+        heartbeatProbe = if (requested == "passive") "passive" else "socks"
+        unsupportedHeartbeatProbe = requested?.takeIf { it.isNotEmpty() && it != "socks" && it != "passive" }
     }
 
     /// Разбор URL пробы: хост, порт и путь с query. Пресеты плоские (http), но
@@ -1394,8 +1427,8 @@ class XrayVpnService : VpnService() {
         }
     }
 
-    /// Активная проба. В Rust-сборке heartbeatProbe всегда "socks" (см. applyHeartbeatProbe):
-    /// HTTP или HTTPS через SOCKS5. Бросает исключение при неудаче — heartbeat-цикл
+    /// Активная проба: HTTP или HTTPS через SOCKS5. Пассивный режим не зовёт её ни
+    /// в цикле, ни при пробуждении. Бросает исключение при неудаче — heartbeat-цикл
     /// считает это провалом.
     private fun runProbe(port: Int) {
         checkTunnelConnectivity(port)

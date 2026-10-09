@@ -266,7 +266,7 @@ class VpnNotifier extends Notifier<VpnState2> {
           ref.read(configProvider).maybeWhen(data: (d) => d, orElse: () => null);
       if (configState == null) return;
       final current = _resolveEffectiveConfig(configState);
-      // Rust-сборка запускает только часть VLESS-профилей: неподдерживаемый
+      // Rust-сборка запускает только часть VLESS/Hysteria2-профилей: неподдерживаемый
       // кандидат не подключится, даже если сервер жив. В Go фильтр пропускает всё.
       final candidates =
           _switchCandidates(configState, settings.heartbeat.switchSource, current)

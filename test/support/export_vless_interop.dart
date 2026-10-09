@@ -1,4 +1,5 @@
-// Used by scripts/test-rust-transports.py; all keys and certificates are ephemeral.
+// Used by scripts/test-rust-transports.py for VLESS and Hysteria2 (hy2://) cases;
+// all keys and certificates are ephemeral.
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';

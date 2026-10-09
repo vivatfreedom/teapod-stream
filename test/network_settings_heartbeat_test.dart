@@ -68,35 +68,43 @@ void main() {
   AppSettings settingsOf(ProviderContainer container) =>
       container.read(settingsProvider).requireValue;
 
-  for (final probe in [HeartbeatProbe.xrayDelay, HeartbeatProbe.passive]) {
-    testWidgets('a stored ${probe.name} probe follows the selected core', (
-      tester,
-    ) async {
-      final container = await pumpScreen(tester, probe);
-      final reason = CoreFeatures.rust.unavailableReason(
-        CoreFeatures.heartbeatProbeFeature(probe)!,
-      )!;
-      expect(find.text(probe.name.toUpperCase()), findsOneWidget);
-      // Rust replaces PASSIVE with the SOCKS probe, which needs a target URL.
-      expect(
-        find.text('Адрес проверки'),
-        CoreFeatures.current.isRust || probe != HeartbeatProbe.passive
-            ? findsOneWidget
-            : findsNothing,
-      );
-      if (!CoreFeatures.current.isRust) {
-        expect(find.text(reason), findsNothing);
-        expect(find.text(reset), findsNothing);
-        return;
-      }
-      expect(find.text(reason), findsOneWidget);
-      await tester.tap(find.text(reset));
-      await tester.pumpAndSettle();
-      expect(settingsOf(container).heartbeat.probe, HeartbeatProbe.socks);
+  testWidgets('a stored XRAYDELAY probe follows the selected core', (
+    tester,
+  ) async {
+    final container = await pumpScreen(tester, HeartbeatProbe.xrayDelay);
+    final reason = CoreFeatures.rust.unavailableReason(
+      CoreFeature.coreDelayProbe,
+    )!;
+    expect(find.text('XRAYDELAY'), findsOneWidget);
+    // Go measures the URL in the core; Rust replaces XRAYDELAY with the SOCKS
+    // probe — both need the target URL.
+    expect(find.text('Адрес проверки'), findsOneWidget);
+    if (!CoreFeatures.current.isRust) {
       expect(find.text(reason), findsNothing);
-      expect(find.text('SOCKS'), findsOneWidget);
-    });
-  }
+      expect(find.text(reset), findsNothing);
+      return;
+    }
+    expect(find.text(reason), findsOneWidget);
+    await tester.tap(find.text(reset));
+    await tester.pumpAndSettle();
+    expect(settingsOf(container).heartbeat.probe, HeartbeatProbe.socks);
+    expect(find.text(reason), findsNothing);
+    expect(find.text('SOCKS'), findsOneWidget);
+  });
+
+  testWidgets('PASSIVE is supported by both cores and needs no target URL', (
+    tester,
+  ) async {
+    final container = await pumpScreen(tester, HeartbeatProbe.passive);
+    expect(find.text('PASSIVE'), findsOneWidget);
+    expect(find.text(reset), findsNothing);
+    expect(find.text('Адрес проверки'), findsNothing);
+    expect(settingsOf(container).heartbeat.probe, HeartbeatProbe.passive);
+    expect(
+      find.textContaining('PASSIVE — без активных проб'),
+      findsOneWidget,
+    );
+  });
 
   testWidgets('the probe picker offers only probes of the selected core', (
     tester,
@@ -105,12 +113,11 @@ void main() {
     await tester.tap(find.text('SOCKS'));
     await tester.pumpAndSettle();
     expect(find.text('heartbeat // probe'), findsOneWidget);
-    for (final probe in [HeartbeatProbe.xrayDelay, HeartbeatProbe.passive]) {
-      expect(
-        find.text(probe.name.toUpperCase()),
-        CoreFeatures.current.isRust ? findsNothing : findsOneWidget,
-      );
-    }
+    expect(
+      find.text('XRAYDELAY'),
+      CoreFeatures.current.isRust ? findsNothing : findsOneWidget,
+    );
+    expect(find.text('PASSIVE'), findsOneWidget);
   });
 
   testWidgets('switchConfig explains how the selected core checks candidates', (

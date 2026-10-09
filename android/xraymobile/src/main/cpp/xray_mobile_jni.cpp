@@ -1,5 +1,6 @@
 #include <jni.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -1268,32 +1269,95 @@ Java_org_xrayrust_mobile_XrayCore_nativeStats(JNIEnv *env, jobject, jlong handle
     return nullptr;
   }
 
-  jlong values[19] = {
-      static_cast<jlong>(stats.inbound_packets),
-      static_cast<jlong>(stats.outbound_packets),
-      static_cast<jlong>(stats.dropped_packets),
-      static_cast<jlong>(stats.udp_remote_open_events),
-      static_cast<jlong>(stats.udp_remote_udp443_open_events),
-      static_cast<jlong>(stats.udp_remote_written_bytes),
-      static_cast<jlong>(stats.udp_remote_read_bytes),
-      static_cast<jlong>(stats.tcp_open_events),
-      static_cast<jlong>(stats.tcp_open_duration_ms_total),
-      static_cast<jlong>(stats.tcp_open_duration_ms_max),
-      static_cast<jlong>(stats.tcp_first_byte_events),
-      static_cast<jlong>(stats.tcp_first_byte_duration_ms_total),
-      static_cast<jlong>(stats.tcp_first_byte_duration_ms_max),
-      static_cast<jlong>(stats.tcp443_open_events),
-      static_cast<jlong>(stats.tcp443_open_duration_ms_total),
-      static_cast<jlong>(stats.tcp443_open_duration_ms_max),
-      static_cast<jlong>(stats.tcp443_first_byte_events),
-      static_cast<jlong>(stats.tcp443_first_byte_duration_ms_total),
-      static_cast<jlong>(stats.tcp443_first_byte_duration_ms_max),
+  // Local change: the original 19 values keep their indices, followed by every
+  // other XrayTunStats field in header order (see XrayCore.stats()). Fields past
+  // a shorter struct_size written by the native library stay zero.
+#define XRAY_TUN_STAT(field) static_cast<jlong>(stats.field),
+  const jlong values[] = {
+      XRAY_TUN_STAT(inbound_packets)
+      XRAY_TUN_STAT(outbound_packets)
+      XRAY_TUN_STAT(dropped_packets)
+      XRAY_TUN_STAT(udp_remote_open_events)
+      XRAY_TUN_STAT(udp_remote_udp443_open_events)
+      XRAY_TUN_STAT(udp_remote_written_bytes)
+      XRAY_TUN_STAT(udp_remote_read_bytes)
+      XRAY_TUN_STAT(tcp_open_events)
+      XRAY_TUN_STAT(tcp_open_duration_ms_total)
+      XRAY_TUN_STAT(tcp_open_duration_ms_max)
+      XRAY_TUN_STAT(tcp_first_byte_events)
+      XRAY_TUN_STAT(tcp_first_byte_duration_ms_total)
+      XRAY_TUN_STAT(tcp_first_byte_duration_ms_max)
+      XRAY_TUN_STAT(tcp443_open_events)
+      XRAY_TUN_STAT(tcp443_open_duration_ms_total)
+      XRAY_TUN_STAT(tcp443_open_duration_ms_max)
+      XRAY_TUN_STAT(tcp443_first_byte_events)
+      XRAY_TUN_STAT(tcp443_first_byte_duration_ms_total)
+      XRAY_TUN_STAT(tcp443_first_byte_duration_ms_max)
+      XRAY_TUN_STAT(inbound_dropped_packets)
+      XRAY_TUN_STAT(outbound_dropped_packets)
+      XRAY_TUN_STAT(tcp_stack_to_remote_bytes)
+      XRAY_TUN_STAT(tcp_remote_written_bytes)
+      XRAY_TUN_STAT(tcp_remote_read_bytes)
+      XRAY_TUN_STAT(tcp_backpressure_events)
+      XRAY_TUN_STAT(tcp_stack_to_remote_backpressure_events)
+      XRAY_TUN_STAT(tcp_remote_to_stack_backpressure_events)
+      XRAY_TUN_STAT(tcp_remote_write_batches)
+      XRAY_TUN_STAT(tcp_remote_write_batch_messages)
+      XRAY_TUN_STAT(tcp_remote_write_batch_max_messages)
+      XRAY_TUN_STAT(tcp_remote_write_batch_max_bytes)
+      XRAY_TUN_STAT(tcp_remote_write_wait_events)
+      XRAY_TUN_STAT(tcp_remote_write_wait_ms_total)
+      XRAY_TUN_STAT(tcp_remote_write_wait_ms_max)
+      XRAY_TUN_STAT(tcp_remote_flush_wait_events)
+      XRAY_TUN_STAT(tcp_remote_flush_wait_ms_total)
+      XRAY_TUN_STAT(tcp_remote_flush_wait_ms_max)
+      XRAY_TUN_STAT(tcp_pending_remote_bytes)
+      XRAY_TUN_STAT(tcp_pending_remote_flows)
+      XRAY_TUN_STAT(tcp_pending_remote_max_bytes)
+      XRAY_TUN_STAT(tcp_pending_upload_bytes)
+      XRAY_TUN_STAT(tcp_pending_upload_max_bytes)
+      XRAY_TUN_STAT(tcp_pending_total_bytes)
+      XRAY_TUN_STAT(tcp_remote_buffer_limit_bytes)
+      XRAY_TUN_STAT(tcp_buffer_hard_limit_bytes)
+      XRAY_TUN_STAT(tcp_remote_buffer_pressure_active)
+      XRAY_TUN_STAT(tcp_remote_write_errors)
+      XRAY_TUN_STAT(tcp_remote_closed_events)
+      XRAY_TUN_STAT(tcp_remote_read_errors)
+      XRAY_TUN_STAT(tcp_open_errors)
+      XRAY_TUN_STAT(active_tcp_flows)
+      XRAY_TUN_STAT(active_udp_flows)
+      XRAY_TUN_STAT(udp_flow_limit)
+      XRAY_TUN_STAT(udp_budget_drops)
+      XRAY_TUN_STAT(udp_evicted_flows)
+      XRAY_TUN_STAT(udp_channel_dropped_packets)
+      XRAY_TUN_STAT(udp_open_errors)
+      XRAY_TUN_STAT(udp_vision_udp443_rejections)
+      XRAY_TUN_STAT(udp_remote_write_errors)
+      XRAY_TUN_STAT(udp_remote_read_errors)
+      XRAY_TUN_STAT(udp_remote_closed_events)
+      XRAY_TUN_STAT(udp_quic_blocked_packets)
+      XRAY_TUN_STAT(inbound_queue_depth)
+      XRAY_TUN_STAT(outbound_queue_depth)
+      XRAY_TUN_STAT(inbound_queue_max_packets)
+      XRAY_TUN_STAT(outbound_queue_max_packets)
+      XRAY_TUN_STAT(tun_fd_write_batches)
+      XRAY_TUN_STAT(tun_fd_write_batch_packets)
+      XRAY_TUN_STAT(tun_fd_write_batch_max_packets)
+      XRAY_TUN_STAT(tun_fd_read_loop_exits)
+      XRAY_TUN_STAT(tun_fd_write_loop_exits)
+      XRAY_TUN_STAT(tun_fd_transient_io_errors)
   };
-  jlongArray array = env->NewLongArray(19);
+#undef XRAY_TUN_STAT
+  constexpr jsize value_count = static_cast<jsize>(sizeof(values) / sizeof(values[0]));
+  static_assert(
+      sizeof(XrayTunStats) - offsetof(XrayTunStats, inbound_packets) ==
+          static_cast<size_t>(value_count) * sizeof(uint64_t),
+      "nativeStats must export every XrayTunStats counter");
+  jlongArray array = env->NewLongArray(value_count);
   if (array == nullptr) {
     return nullptr;
   }
-  env->SetLongArrayRegion(array, 0, 19, values);
+  env->SetLongArrayRegion(array, 0, value_count, values);
   return array;
 } XRAY_JNI_CATCH_RETURN(env, nullptr)
 

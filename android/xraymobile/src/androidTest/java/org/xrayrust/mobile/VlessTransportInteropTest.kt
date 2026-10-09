@@ -11,14 +11,20 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.DataInputStream
 import java.io.File
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.security.KeyStore
 import java.security.cert.CertificateFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.TrustManagerFactory
 
+/** VLESS combinations and Hysteria2 (cases with `udpEcho` also relay SOCKS UDP). */
 @RunWith(AndroidJUnit4::class)
 class VlessTransportInteropTest {
     @Test fun productionProfilesExchangeDataWithReferenceXray() {
@@ -61,6 +67,10 @@ class VlessTransportInteropTest {
                             echo(it)
                         }
                     }
+                    if (entry.optBoolean("udpEcho")) {
+                        udpEcho(port, fixture.getInt("udpEchoPort"))
+                        Log.i("TeapodVlessInterop", "$name: SOCKS UDP echo passed")
+                    }
                     core.stop()
                 }
                 Log.i("TeapodVlessInterop", "$name: plain and inner-TLS payloads verified")
@@ -89,6 +99,60 @@ class VlessTransportInteropTest {
         } catch (error: Throwable) {
             client.close()
             throw error
+        }
+    }
+
+    /** SOCKS5 UDP ASSOCIATE; 3000 bytes exceed one 1200-byte QUIC datagram. */
+    private fun udpEcho(port: Int, target: Int) {
+        Socket("127.0.0.1", port).use { control ->
+            control.soTimeout = 15000
+            val out = control.getOutputStream()
+            val input = DataInputStream(control.getInputStream())
+            out.write(byteArrayOf(5, 1, 0))
+            assertEquals(5, input.readUnsignedByte()); assertEquals(0, input.readUnsignedByte())
+            out.write(byteArrayOf(5, 3, 0, 1, 0, 0, 0, 0, 0, 0))
+            assertEquals(5, input.readUnsignedByte()); assertEquals(0, input.readUnsignedByte())
+            input.readUnsignedByte()
+            val host = when (input.readUnsignedByte()) {
+                1 -> InetAddress.getByAddress(ByteArray(4).also { input.readFully(it) })
+                4 -> InetAddress.getByAddress(ByteArray(16).also { input.readFully(it) })
+                3 -> InetAddress.getByName(String(ByteArray(input.readUnsignedByte()).also { input.readFully(it) }))
+                else -> error("Invalid SOCKS address")
+            }
+            val relay = InetSocketAddress(
+                if (host.isAnyLocalAddress) InetAddress.getLoopbackAddress() else host,
+                input.readUnsignedShort())
+            DatagramSocket().use { udp ->
+                udp.soTimeout = 5000
+                val header = byteArrayOf(0, 0, 0, 1, 127, 0, 0, 1, (target shr 8).toByte(), target.toByte())
+                for (size in intArrayOf(64, 1000, 3000)) {
+                    val payload = ByteArray(size) { ((it * 31 + size) and 255).toByte() }
+                    val datagram = header + payload
+                    val buffer = ByteArray(65536)
+                    var reply: ByteArray? = null
+                    // UDP may lose a datagram; the payload itself must come back intact.
+                    for (attempt in 0 until 3) {
+                        udp.send(DatagramPacket(datagram, datagram.size, relay))
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        try {
+                            udp.receive(packet)
+                        } catch (_: SocketTimeoutException) {
+                            continue
+                        }
+                        reply = buffer.copyOf(packet.length)
+                        break
+                    }
+                    val received = requireNotNull(reply) { "No UDP reply for $size bytes" }
+                    check(received.size > 4 && received[2].toInt() == 0) { "Invalid SOCKS UDP reply" }
+                    val offset = when (received[3].toInt()) {
+                        1 -> 10
+                        4 -> 22
+                        3 -> 7 + (received[4].toInt() and 255)
+                        else -> error("Invalid SOCKS UDP address")
+                    }
+                    assertArrayEquals(payload, received.copyOfRange(offset, received.size))
+                }
+            }
         }
     }
 

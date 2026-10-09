@@ -7,7 +7,15 @@ import '../../core/models/routing_settings.dart';
 import '../../core/models/vpn_config.dart';
 import 'xray_config_builder.dart';
 
-/// Supported VLESS carrier/security combinations integrated with Android TUN.
+/// Supported VLESS carrier/security combinations and Hysteria2 integrated with
+/// Android TUN.
+///
+/// TLS certificate pins win over `allowInsecure`: a profile with both is built
+/// with `allowInsecure: false` and `pinnedPeerCertSha256`, so the server must
+/// present exactly the pinned certificate — stricter than the request, and the
+/// usual intent of such links (a self-signed server identified by its pin).
+/// xray-rust, like current Xray-core, has no unverified mode, so
+/// `allowInsecure` without a pin is rejected.
 class RustConfigBuilder {
   static const visionFlows = {'xtls-rprx-vision', 'xtls-rprx-vision-udp443'};
   static const _transports = {
@@ -35,8 +43,11 @@ class RustConfigBuilder {
     if (config.rawXrayConfig != null) {
       return 'Импорт полного JSON в Rust-сборке пока недоступен.';
     }
+    if (config.protocol == VpnProtocol.hysteria2) {
+      return _hysteria2UnsupportedReason(config);
+    }
     if (config.protocol != VpnProtocol.vless) {
-      return 'Rust-сборка поддерживает протокол VLESS.';
+      return 'Rust-сборка поддерживает протоколы VLESS и Hysteria2.';
     }
     if (config.encryption != null && config.encryption != 'none') {
       return 'Rust-сборка пока принимает VLESS с encryption=none.';
@@ -70,9 +81,52 @@ class RustConfigBuilder {
         !CoreFeatures.rust.supports(CoreFeature.visionWithTls)) {
       return CoreFeatures.rust.unavailableReason(CoreFeature.visionWithTls);
     }
-    if (config.security == VpnSecurity.tls && config.allowInsecure) {
-      return 'Rust не поддерживает allowInsecure. Используй действительный TLS-сертификат или pinSHA256.';
+    if (config.security == VpnSecurity.tls && _insecureWithoutPin(config)) {
+      return _insecureReason;
     }
+    if (config.ech?.isNotEmpty ?? false) {
+      return 'ECH пока недоступен в Rust-сборке.';
+    }
+    return null;
+  }
+
+  /// xray-rust 0.7.0 caps a config at 250,000 domain matchers
+  /// (MAX_CONFIG_DOMAIN_MATCHERS), shared by routing and DNS-outbound rules, and
+  /// expands each geosite entry into one matcher. Ad blocking alone takes about
+  /// 187k (category-ads-all 186,402 + win-spy 327 in the bundled Loyalsoldier
+  /// 202609082347), so a GeoSite rule with one of these (cn 111,168,
+  /// china-list 110,433) cannot be parsed and the VPN would not start.
+  static const _largeGeositeCodes = {'cn', 'china-list', 'category-ads-all'};
+
+  static const _insecureReason =
+      'Rust не поддерживает allowInsecure без pinSHA256. Используй действительный TLS-сертификат или укажи pinSHA256 сертификата сервера.';
+
+  static bool _hasPin(VpnConfig config) =>
+      config.pinSHA256?.trim().isNotEmpty ?? false;
+
+  static bool _insecureWithoutPin(VpnConfig config) =>
+      config.allowInsecure && !_hasPin(config);
+
+  /// xray-rust 0.7.0: Hysteria2 over stock QUIC TLS (h3), one server port,
+  /// default BBR. Salamander, hopping, Brutal/QUIC overrides and sockopt
+  /// (dialerProxy/noise) are rejected by the core's config parser.
+  static String? _hysteria2UnsupportedReason(VpnConfig config) {
+    if (config.obfsPassword?.isNotEmpty ?? false) {
+      return 'Обфускация Salamander (obfs) для Hysteria2 пока недоступна в Rust-сборке.';
+    }
+    if (config.hopPorts?.isNotEmpty ?? false) {
+      return 'Смена портов (port hopping, ${config.hopPorts}) для Hysteria2 пока недоступна в Rust-сборке. Укажи один порт сервера.';
+    }
+    if (config.finalmask != null) {
+      return 'finalmask для Hysteria2 недоступен в Rust-сборке.';
+    }
+    final auth = config.password ?? '';
+    if (auth.isEmpty ||
+        utf8.encode(auth).length > 4096 ||
+        auth.codeUnits.any((c) => c < 0x20 || c == 0x7f)) {
+      return 'Пароль Hysteria2 должен быть непустым, не длиннее 4096 байт и без управляющих символов.';
+    }
+    if (_insecureWithoutPin(config)) return _insecureReason;
     if (config.ech?.isNotEmpty ?? false) {
       return 'ECH пока недоступен в Rust-сборке.';
     }
@@ -92,20 +146,21 @@ class RustConfigBuilder {
         'В Rust-пробнике доступен только режим VPN (TUN).',
       );
     }
-    if ((!CoreFeatures.rust.supports(CoreFeature.mux) && options.mux.enabled) ||
+    // Go не применяет Mux и фрагментацию к Hysteria2 (QUIC сам мультиплексирует
+    // потоки, TCP-фрагментов нет), значит и здесь они не мешают. Noise Go
+    // применяет к UDP-плечу через dialerProxy — xray-rust его отвергает.
+    final hysteria2 = config.protocol == VpnProtocol.hysteria2;
+    if ((!CoreFeatures.rust.supports(CoreFeature.mux) &&
+            options.mux.enabled &&
+            !hysteria2) ||
         (!CoreFeatures.rust.supports(CoreFeature.fragmentation) &&
-            options.fragment.enabled) ||
+            options.fragment.enabled &&
+            !hysteria2) ||
         (!CoreFeatures.rust.supports(CoreFeature.noise) &&
             options.noise.enabled) ||
         config.finalmask != null) {
       throw const FormatException(
         'Отключи Mux, фрагментацию, noise и finalmask для Rust-пробника.',
-      );
-    }
-    if (!CoreFeatures.rust.supports(CoreFeature.adBlocking) &&
-        options.routing.adBlockEnabled) {
-      throw const FormatException(
-        'Блокировка рекламы пока недоступна в Rust-пробнике.',
       );
     }
     if (options.routing.isActive &&
@@ -118,9 +173,17 @@ class RustConfigBuilder {
         'Включи определение доменов для GeoSite и доменных правил.',
       );
     }
-    if (!CoreFeatures.rust.supports(CoreFeature.directDns) &&
-        options.dnsMode != DnsMode.proxy) {
-      throw const FormatException('Для Rust-пробника выбери DNS «Через VPN».');
+    if (options.routing.adBlockEnabled &&
+        options.routing.isActive &&
+        options.routing.geositeEnabled &&
+        options.routing.geositeCodes.any(
+          (c) => _largeGeositeCodes.contains(c.trim().toLowerCase()),
+        )) {
+      throw const FormatException(
+        'Блокировка рекламы (~187 тыс. доменов) вместе с большой категорией GeoSite '
+        '(cn, china-list, category-ads-all) превышает лимит Rust-ядра в 250 тыс. '
+        'доменных правил. Отключи одно из двух.',
+      );
     }
     if ((!CoreFeatures.rust.supports(CoreFeature.quicBlocking) &&
             options.blockQuic) ||
@@ -137,8 +200,10 @@ class RustConfigBuilder {
     // the Go-specific inbound and policy. Native TUN traffic never uses SOCKS.
     final result = XrayConfigBuilder.build(config, options);
     result.remove('policy');
+    if (options.dnsMode == DnsMode.direct) _routeDnsDirect(result, options);
     // Resolve for IP rules only. Domain-only routing can pass the name to
-    // VLESS without an extra client-side DNS round trip for every new host.
+    // the server (VLESS or Hysteria2 both carry domain destinations) without
+    // an extra client-side DNS round trip for every new host.
     result['routing']['domainStrategy'] =
         options.routing.isActive &&
             (options.routing.geoEnabled || options.routing.bypassLocal)
@@ -172,6 +237,7 @@ class RustConfigBuilder {
     // Loopback SOCKS is retained for the app's IP check and heartbeat only.
     final outbounds = result['outbounds'] as List<dynamic>;
     outbounds.removeWhere((dynamic out) => out['protocol'] == 'blackhole');
+    if (options.routing.adBlockEnabled) _blockAdsInDnsOutbound(result);
     final rules = (result['routing'] as Map)['rules'] as List<dynamic>;
     for (final dynamic rule in rules) {
       final tags = rule['inboundTag'];
@@ -195,10 +261,14 @@ class RustConfigBuilder {
         if (config.xhttpExtra != null) 'extra': config.xhttpExtra,
       };
     }
-    if (config.security == VpnSecurity.tls &&
-        (config.pinSHA256?.isNotEmpty ?? false)) {
-      (stream['tlsSettings'] as Map<String, dynamic>)['pinnedPeerCertSha256'] =
-          _certificatePins(config.pinSHA256!);
+    // pinnedPeerCertSha256 и allowInsecure: false при пине уже выставил
+    // XrayConfigBuilder — тот же ключ читают оба ядра.
+    final tls = stream['tlsSettings'] as Map<String, dynamic>?;
+    if (hysteria2 && tls != null) {
+      // QUIC TLS не маскируется под браузер, ALPN Hysteria2 — только h3,
+      // и ядро подставляет его само.
+      tls.remove('fingerprint');
+      tls.remove('alpn');
     }
     if (options.routing.direction == RoutingDirection.onlySelected) {
       final direct = outbounds.singleWhere(
@@ -208,6 +278,68 @@ class RustConfigBuilder {
       outbounds.insert(0, direct);
     }
     return result;
+  }
+
+  /// Go в режиме «напрямую» отдаёт порт 53 в freedom (до своего TUN-DNS
+  /// 1.1.1.1) и резолвит сам через `localhost`. Здесь приложения спрашивают
+  /// якорь 198.18.0.1, который freedom не достанет, а `localhost` для xray-rust —
+  /// DNS-сервер с именем localhost:53, не системный резолвер (его при StaticOnly
+  /// у ядра нет). Поэтому, как и в режиме «через VPN», запросы приложений
+  /// принимает DNS-outbound и отвечает через DNS-модуль с выбранным сервером,
+  /// но сам модуль (`dns-module`, и для своих поисков ядра) ходит в direct —
+  /// мимо туннеля, защищёнными сокетами.
+  static void _routeDnsDirect(
+    Map<String, dynamic> result,
+    VpnEngineOptions options,
+  ) {
+    result['dns'] = XrayConfigBuilder.buildResolverDnsBlock(options);
+    final rules = (result['routing'] as Map)['rules'] as List<dynamic>;
+    final goRule = rules.indexWhere(
+      (dynamic r) =>
+          r['port'] == '53' &&
+          r['outboundTag'] == 'direct' &&
+          r['inboundTag'] == null,
+    );
+    if (goRule < 0) throw StateError('Go direct-DNS rule not found');
+    rules.replaceRange(goRule, goRule + 1, <Map<String, dynamic>>[
+      {
+        'type': 'field',
+        'inboundTag': ['dns-module'],
+        'outboundTag': 'direct',
+      },
+      {
+        'type': 'field',
+        'inboundTag': ['socks-in'],
+        'port': '53',
+        'network': 'udp,tcp',
+        'outboundTag': 'dns-out',
+      },
+    ]);
+  }
+
+  /// Go отвечает на рекламные домены пустым NOERROR: DNS-сервер
+  /// `rcode://success` со списком domains. xray-rust такой сервер не принимает,
+  /// то же делает правило Return у DNS-outbound, через который идут DNS-запросы
+  /// приложений (и с FakeDNS, и в режиме «напрямую»). Домены — те же, что у Go.
+  static void _blockAdsInDnsOutbound(Map<String, dynamic> result) {
+    final servers = (result['dns'] as Map)['servers'] as List<dynamic>;
+    final adServer = servers.singleWhere(
+      (dynamic s) => s is Map && s['address'] == 'rcode://success',
+    );
+    servers.remove(adServer);
+    final outbounds = result['outbounds'] as List<dynamic>;
+    final dnsOut = outbounds.indexWhere(
+      (dynamic out) => out['protocol'] == 'dns',
+    );
+    // Go пишет dns-out литералом Map<String, String> — собираем заново.
+    outbounds[dnsOut] = <String, dynamic>{
+      ...outbounds[dnsOut] as Map,
+      'settings': {
+        'rules': [
+          {'action': 'return', 'rCode': 0, 'domain': adServer['domains']},
+        ],
+      },
+    };
   }
 
   /// xray-rust reads a DoT server's port only from its `tls://` URL and ignores
@@ -231,29 +363,6 @@ class RustConfigBuilder {
         server['address'] = address.substring(1, address.length - 1);
       }
     }
-  }
-
-  /// Native Rust expects SHA-256 of the full DER certificate as hex.
-  static String _certificatePins(String value) {
-    final pins = <String>[];
-    for (final entry in value.split(',')) {
-      final raw = entry.trim();
-      final hex = raw.replaceAll(':', '');
-      if (RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(hex)) {
-        pins.add(hex.toLowerCase());
-        continue;
-      }
-      try {
-        final bytes = base64.decode(raw);
-        if (bytes.length != 32) throw const FormatException();
-        pins.add(bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join());
-      } on FormatException {
-        throw const FormatException(
-          'pinSHA256 должен быть SHA-256 сертификата: 64 hex-символа или base64 от 32 байт.',
-        );
-      }
-    }
-    return pins.join(',');
   }
 
   static String buildJson(VpnConfig config, VpnEngineOptions options) =>

@@ -77,7 +77,7 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
 
   void _update(AppSettings s) => ref.read(settingsProvider.notifier).save(s);
 
-  /// XRAYDELAY и PASSIVE есть только в Go. Сохранённое неподдерживаемое значение
+  /// XRAYDELAY есть только в Go. Сохранённое неподдерживаемое значение
   /// остаётся видно с объяснением и явным сбросом на SOCKS-пробу.
   Widget _heartbeatProbeGate(AppSettings s, bool locked, Widget child) {
     final feature = CoreFeatures.heartbeatProbeFeature(s.heartbeat.probe);
@@ -710,7 +710,7 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
                           t: t,
                           title: 'Тип проверки',
                           hint: CoreFeatures.current.isRust
-                              ? 'SOCKS — HTTP(S)-запрос через локальный SOCKS5 в xray-rust. XRAYDELAY и PASSIVE есть только в Go-сборке'
+                              ? 'SOCKS — HTTP(S)-запрос через локальный SOCKS5 в xray-rust; PASSIVE — без активных проб, только счётчики TUN Rust-ядра (экономит батарею, обрыв виден лишь при реальном трафике). XRAYDELAY есть только в Go-сборке'
                               : 'SOCKS — HTTP-запрос через SOCKS5 в xray; XRAYDELAY — замер внутри ядра, сразу даёт задержку; PASSIVE — без активных проб, только метрики tun2socks (экономит батарею, обрыв виден лишь при реальном трафике)',
                           value: s.heartbeat.probe.name.toUpperCase(),
                           locked: locked,
@@ -725,7 +725,7 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
                           ),
                         ),
                       ),
-                      // Адрес нужен любой активной пробе; в Rust сохранённый PASSIVE
+                      // Адрес нужен любой активной пробе; в Rust сохранённый XRAYDELAY
                       // заменяется SOCKS-пробой, которая стучится по этому адресу.
                       if (CoreFeatures.current.effectiveHeartbeatProbe(s.heartbeat.probe) !=
                           HeartbeatProbe.passive) ...[

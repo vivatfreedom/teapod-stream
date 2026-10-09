@@ -7,6 +7,16 @@ under MPL-2.0; see ../../third_party/xray-rust/LICENSE.
 Local changes add `geodataDirectory` to `XrayCore.create`, calling the existing
 `xray_core_set_geodata_search_dir_exclusive` **before** configuration loading.
 This avoids global working-directory changes and reflection into private handles.
+
+`nativeStats` returns the whole `XrayTunStats` struct (72 counters) instead of
+upstream's 19: those 19 keep their array indices, and the remaining fields follow
+in header order. A `static_assert` fails the build if the header gains a counter
+that is not exported. `XrayTunStats` appends the new Kotlin properties with
+default `0`, so existing constructor callers compile unchanged. The app uses the
+live TUN counters (`tcp/udpRemoteRead/WrittenBytes`, `activeTcp/UdpFlows`,
+`tunFdRead/WriteLoopExits`) for traffic speed and the heartbeat watchdog.
+`TunStatsTest` (androidTest; no VPN permission or fixture needed) sends a UDP echo
+through the core's packet I/O and checks the appended fields while the flow is open.
 The C header is unchanged from upstream.
 
 The native core is built from the same commit without local patches. The former

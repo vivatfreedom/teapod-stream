@@ -46,18 +46,22 @@ void main() {
 
     test('учитывает только значения, которые доходят до native', () {
       const base = AppSettings();
-      final passive = base.copyWith(
-          heartbeat: base.heartbeat.copyWith(probe: HeartbeatProbe.passive));
-      final socks = base.copyWith(
-          heartbeat: base.heartbeat.copyWith(probe: HeartbeatProbe.socks));
+      AppSettings withProbe(HeartbeatProbe probe) =>
+          base.copyWith(heartbeat: base.heartbeat.copyWith(probe: probe));
+      final xrayDelay = withProbe(HeartbeatProbe.xrayDelay);
+      final passive = withProbe(HeartbeatProbe.passive);
+      final socks = withProbe(HeartbeatProbe.socks);
       final tethering = base.copyWith(allowTethering: true);
       final noTethering = base.copyWith(allowTethering: false);
+      // PASSIVE доходит до native в обеих сборках: смена пробы меняет сессию.
+      expect(connectionFingerprint(passive), isNot(connectionFingerprint(socks)));
       if (CoreFeatures.current.isRust) {
-        // Rust шлёт SOCKS и allowTethering=false: сброс этих значений сессию не меняет.
-        expect(connectionFingerprint(passive), connectionFingerprint(socks));
+        // Rust шлёт вместо XRAYDELAY SOCKS и allowTethering=false: сброс этих
+        // значений сессию не меняет.
+        expect(connectionFingerprint(xrayDelay), connectionFingerprint(socks));
         expect(connectionFingerprint(tethering), connectionFingerprint(noTethering));
       } else {
-        expect(connectionFingerprint(passive), isNot(connectionFingerprint(socks)));
+        expect(connectionFingerprint(xrayDelay), isNot(connectionFingerprint(socks)));
         expect(connectionFingerprint(tethering),
             isNot(connectionFingerprint(noTethering)));
       }

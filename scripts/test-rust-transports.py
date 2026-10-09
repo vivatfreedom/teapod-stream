@@ -4,6 +4,9 @@
 Requires a running Android emulator, openssl, Flutter and JDK/Android tools.
 Set XRAY_REFERENCE to a local binary, or use the downloaded pinned Linux binary.
 No live subscription, user UUID or remote VPN endpoint is used.
+Covers the 10 VLESS combinations and Hysteria2 (UDP inbound, h3, pinned
+self-signed certificate) with TCP and SOCKS UDP echo. TEAPOD_INTEROP_VISION_ONLY=1
+or TEAPOD_INTEROP_HYSTERIA_ONLY=1 selects a subset.
 """
 import base64
 import contextlib
@@ -11,6 +14,7 @@ import hashlib
 import json
 import os
 import pathlib
+import secrets
 import socket
 import socketserver
 import ssl
@@ -31,9 +35,20 @@ class Echo(socketserver.BaseRequestHandler):
                 self.request.sendall(data)
 
 
+class UdpEcho(socketserver.BaseRequestHandler):
+    def handle(self):
+        data, sock = self.request
+        with contextlib.suppress(OSError):
+            sock.sendto(data, self.client_address)
+
+
 class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+
+class UdpServer(socketserver.ThreadingUDPServer):
+    daemon_threads = True
 
 
 class TlsServer(Server):
@@ -51,8 +66,8 @@ def run(args, **kwargs):
     return subprocess.run(args, check=True, **kwargs)
 
 
-def free_port():
-    with socket.socket() as sock:
+def free_port(kind=socket.SOCK_STREAM):
+    with socket.socket(socket.AF_INET, kind) as sock:
         sock.bind(('127.0.0.1', 0))
         return sock.getsockname()[1]
 
@@ -80,9 +95,10 @@ def main():
         tls.minimum_version = ssl.TLSVersion.TLSv1_3
         tls.load_cert_chain(cert, key)
         tls.set_alpn_protocols(['h2', 'http/1.1'])
-        with Server(('127.0.0.1', 0), Echo) as echo, TlsServer(('127.0.0.1', 0), Echo) as cover:
+        with Server(('127.0.0.1', 0), Echo) as echo, TlsServer(('127.0.0.1', 0), Echo) as cover, \
+                UdpServer(('127.0.0.1', 0), UdpEcho) as udp_echo:
             cover.tls = tls
-            for server in (echo, cover):
+            for server in (echo, cover, udp_echo):
                 threading.Thread(target=server.serve_forever, daemon=True).start()
             generated = subprocess.check_output([str(reference), 'x25519'], text=True)
             keys = {k.strip().replace(' ', ''): v.strip() for k, v in
@@ -95,8 +111,11 @@ def main():
             combinations += [(t, 'tls', '') for t in ['ws', 'httpupgrade']]
             combinations += [('tcp', s, f) for s in ['reality']
                              for f in ['xtls-rprx-vision', 'xtls-rprx-vision-udp443']]
+            hysteria_only = os.environ.get('TEAPOD_INTEROP_HYSTERIA_ONLY') == '1'
             if os.environ.get('TEAPOD_INTEROP_VISION_ONLY') == '1':
                 combinations = [item for item in combinations if item[2]]
+            if hysteria_only:
+                combinations = []
             for transport, security, flow in combinations:
                 port = free_port()
                 while any(item['port'] == port for item in inbounds):
@@ -128,9 +147,30 @@ def main():
                     settings=dict(clients=[user], decryption='none'), streamSettings=stream))
                 url = f'vless://{user["id"]}@10.0.2.2:{port}?' + urllib.parse.urlencode(params)
                 cases.append(dict(name=name, url=url))
+            vless_cases = len(cases)
+            if os.environ.get('TEAPOD_INTEROP_VISION_ONLY') != '1' or hysteria_only:
+                # One UDP inbound. The certificate is self-signed: Rust trusts it
+                # only through pinSHA256; insecure=1 checks that the pin wins.
+                port = free_port(socket.SOCK_DGRAM)
+                while any(item['port'] == port for item in inbounds):
+                    port = free_port(socket.SOCK_DGRAM)
+                auth = secrets.token_hex(16)
+                inbounds.append(dict(listen='127.0.0.1', port=port, protocol='hysteria',
+                    settings=dict(version=2, users=[dict(auth=auth)]),
+                    streamSettings=dict(network='hysteria', security='tls', hysteriaSettings=dict(version=2),
+                        tlsSettings=dict(alpn=['h3'], certificates=[
+                            dict(certificateFile=str(cert), keyFile=str(key))]))))
+                # Official share-link form: `host:port/?query`.
+                base = f'hysteria2://{auth}@10.0.2.2:{port}/?'
+                cases.append(dict(name='hysteria2-pin', udpEcho=True,
+                    url=base + urllib.parse.urlencode(dict(sni='cover.example', pinSHA256=pin))))
+                cases.append(dict(name='hysteria2-insecure-pin', udpEcho=True,
+                    url=base + urllib.parse.urlencode(dict(insecure='1', sni='cover.example', pinSHA256=pin))))
+            hysteria_cases = len(cases) - vless_cases
             source = directory / 'input.json'
             source.write_text(json.dumps(dict(cases=cases, echoPort=echo.server_address[1],
-                tlsEchoPort=cover.server_address[1], certificatePem=cert.read_text())))
+                tlsEchoPort=cover.server_address[1], udpEchoPort=udp_echo.server_address[1],
+                certificatePem=cert.read_text())))
             config = directory / 'server.json'
             config.write_text(json.dumps(dict(log=dict(loglevel='warning'), inbounds=inbounds,
                 outbounds=[dict(protocol='freedom', settings=dict(finalRules=[dict(action='allow')]))])))
@@ -141,13 +181,21 @@ def main():
             with (directory / 'xray.log').open('w+') as log:
                 process = subprocess.Popen([str(reference), 'run', '-config', str(config)], stdout=log, stderr=log)
                 try:
+                    # A UDP inbound cannot be probed with a TCP connect. Xray logs
+                    # "Xray <version> started" (warning level) after every inbound
+                    # is listening; TCP inbounds are additionally connected to.
                     deadline = time.monotonic() + 15
+                    tcp_ports = [item['port'] for item in inbounds if item['protocol'] != 'hysteria']
                     while True:
                         if process.poll() is not None:
                             raise RuntimeError('Local Xray failed to start: ' + config.name)
                         try:
-                            with socket.create_connection(('127.0.0.1', inbounds[0]['port']), timeout=1):
-                                break
+                            if ' started' not in (directory / 'xray.log').read_text(errors='replace'):
+                                raise OSError('not started')
+                            for port in tcp_ports:
+                                with socket.create_connection(('127.0.0.1', port), timeout=1):
+                                    pass
+                            break
                         except OSError:
                             if time.monotonic() > deadline: raise RuntimeError('Local Xray startup timed out')
                             time.sleep(.1)
@@ -158,7 +206,8 @@ def main():
                          '-Pandroid.testInstrumentationRunnerArguments.class=org.xrayrust.mobile.VlessTransportInteropTest',
                          '-Pandroid.testInstrumentationRunnerArguments.interopConfig=' + fixture_path],
                         cwd=ROOT / 'android', env=env)
-                    print(f'PASS: {len(cases)} VLESS combinations, plain and inner-TLS echo', flush=True)
+                    print(f'PASS: {vless_cases} VLESS and {hysteria_cases} Hysteria2 combinations, '
+                          'plain and inner-TLS echo, Hysteria2 SOCKS UDP echo', flush=True)
                 except Exception:
                     log.flush(); log.seek(0)
                     print(log.read()[-10000:], flush=True)
@@ -168,7 +217,7 @@ def main():
                     try: process.wait(timeout=5)
                     except subprocess.TimeoutExpired: process.kill(); process.wait()
                     subprocess.run(adb + ['shell', 'rm', '-f', fixture_path], capture_output=True)
-                    echo.shutdown(); cover.shutdown()
+                    echo.shutdown(); cover.shutdown(); udp_echo.shutdown()
 
 
 if __name__ == '__main__':
