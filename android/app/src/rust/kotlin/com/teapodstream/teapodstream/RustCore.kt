@@ -20,7 +20,7 @@ import java.util.concurrent.TimeoutException
 
 /** Owns one Rust runtime. Android owns the borrowed TUN descriptor. */
 internal object RustCore {
-    const val VERSION = "xray-rust 0.7.0"
+    const val VERSION = "xray-rust 0.8.1"
     private const val RESOLVE_TIMEOUT_SECONDS = 5L
     private const val RESOLVE_TIMEOUT_MESSAGE = "Не удалось вовремя разрешить адрес VPN-сервера"
     private const val RESOLVE_DNS_TIMEOUT_MESSAGE = "Не удалось вовремя разрешить адрес DNS-сервера"

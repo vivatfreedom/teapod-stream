@@ -1,7 +1,8 @@
-# Android binding for xray-rust 0.7.0
+# Android binding for xray-rust 0.8.1
 
-The Kotlin `XrayCore`, JNI implementation and C header are copied from tag v0.7.0,
-https://github.com/aimalygin/xray-rust/tree/67969094b352f948c6b8b9e2ac75402c577cb7f7
+The Kotlin `XrayCore` and `XrayTunAdmission`, JNI implementation and C header are
+copied from tag v0.8.1,
+https://github.com/aimalygin/xray-rust/tree/5b61eee201fac8639cb1dac0349e34af65db90f7
 under MPL-2.0; see ../../third_party/xray-rust/LICENSE.
 
 Local changes add `geodataDirectory` to `XrayCore.create`, calling the existing
@@ -23,12 +24,14 @@ The native core is built from the same commit without local patches. The former
 `geo-budgets.patch` is gone: v0.7.0 ships the same parsing budgets that fit the
 bundled US GeoIP category (300,531 CIDRs): 500,000 CIDRs per category,
 750,000 IP matchers per config, 1,000,000 total matchers. The app reports this
-build as `xray-rust 0.7.0`.
+build as `xray-rust 0.8.1`.
 
-The C ABI is now 1.7 (was 1.4). The additions are additive: offline profile
-import (`xray_profile_import_json`, wrapped internally by the upstream binding)
-and WireGuard/Hysteria socket rebinding after a network change. This app does
-not use them yet.
+The C ABI is 1.12. Since 0.7.0 it added, all additively: Trojan, Shadowsocks
+2022 and VMess AEAD outbounds, TUN flow admission (`XrayTunAdmissionOptions`,
+Android UID helpers), configurable Hysteria stream budgets, the on-demand
+outbound URL probe (`probeOutboundUrl`), Kotlin Hysteria/WireGuard rebind, TLS
+ClientHello fragmentation and FinalMask UDP noise, and the startup-probe
+preflight capability.
 
 `scripts/build-rust-core.py` pins Rust 1.96.0 and builds arm64/x86_64 with the
 Android NDK 28.2.13676358 and 16 KiB ELF alignment. The source cache and outputs

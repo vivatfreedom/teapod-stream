@@ -10,8 +10,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / '.native/xray-rust'
-VERSION = '0.7.0'
-COMMIT = '67969094b352f948c6b8b9e2ac75402c577cb7f7'
+VERSION = '0.8.1'
+COMMIT = '5b61eee201fac8639cb1dac0349e34af65db90f7'
 TOOLCHAIN = '1.96.0'
 NDK_VERSION = '28.2.13676358'
 STAMP = ROOT / '.native/rust-build.json'
@@ -50,7 +50,7 @@ def main():
     actual = subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip()
     if actual != COMMIT:
         raise RuntimeError('Native source revision differs from the pinned commit.')
-    # v0.7.0 includes the GeoIP budgets that earlier builds patched locally.
+    # Since v0.7.0 upstream includes the GeoIP budgets that earlier builds patched locally.
     if subprocess.check_output(['git', '-C', str(SOURCE), 'status', '--porcelain'], text=True).strip():
         raise RuntimeError('Native source checkout has local changes; the Rust core is built unmodified.')
     run(['rustup', 'toolchain', 'install', TOOLCHAIN, '--profile', 'minimal', '--no-self-update'])
