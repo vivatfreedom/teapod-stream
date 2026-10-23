@@ -24,7 +24,14 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.TrustManagerFactory
 
-/** VLESS combinations and Hysteria2 (cases with `udpEcho` also relay SOCKS UDP). */
+/**
+ * Production configs (VLESS, Trojan, VMess, Shadowsocks 2022, Hysteria2, with the
+ * app's fragmentation, noise, QUIC and UDP settings) from scripts/test-rust-transports.py
+ * against the pinned reference Xray. Every case carries plain and inner-TLS payloads
+ * through SOCKS and runs both outbound probes. `udpEcho` cases relay SOCKS UDP;
+ * `udpBlocked` cases must drop it; `tunUdp` sends UDP packets through the TUN packet
+ * path to the host's echo and to port 443, which the server redirects to the echo.
+ */
 @RunWith(AndroidJUnit4::class)
 class VlessTransportInteropTest {
     @Test fun productionProfilesExchangeDataWithReferenceXray() {
@@ -68,19 +75,53 @@ class VlessTransportInteropTest {
                         }
                     }
                     if (entry.optBoolean("udpEcho")) {
-                        udpEcho(port, fixture.getInt("udpEchoPort"))
+                        socksUdp(port, fixture.getInt("udpEchoPort"), expectReply = true)
                         Log.i("TeapodVlessInterop", "$name: SOCKS UDP echo passed")
                     }
+                    if (entry.optBoolean("udpBlocked")) {
+                        socksUdp(port, fixture.getInt("udpEchoPort"), expectReply = false)
+                        Log.i("TeapodVlessInterop", "$name: SOCKS UDP dropped as configured")
+                    }
+                    entry.optJSONObject("tunUdp")?.let { expect ->
+                        // Fresh source ports: a dropped UDP tuple stays dropped until idle.
+                        tunUdp(core, 40_000 + index * 2, fixture.getInt("udpEchoPort"), expect.getBoolean("echo"))
+                        tunUdp(core, 40_001 + index * 2, 443, expect.getBoolean("quic"))
+                        Log.i("TeapodVlessInterop", "$name: TUN UDP echo=${expect.getBoolean("echo")} " +
+                            "udp443=${expect.getBoolean("quic")} as expected")
+                    }
+                    // XRAYDELAY: the app probes the proxy leaf of the running core.
+                    probeUrl(fixture)?.let { url ->
+                        val result = core.probeOutboundUrl(url, 10_000, "proxy")
+                        check(result.isReachable) { "in-core probe: ${result.failureKind} ${result.httpStatus ?: ""}" }
+                        Log.i("TeapodVlessInterop", "$name: in-core probe ${result.delayMs} ms")
+                    }
                     core.stop()
+                }
+                // switchConfig: a temporary core from the production probe variant
+                // (ephemeral loopback SOCKS, proxy leaf only) while none other runs.
+                val probe = entry.optString("probe")
+                val url = probeUrl(fixture)
+                if (probe.isNotEmpty() && url != null) {
+                    XrayCore.create(probe).use { candidate ->
+                        candidate.start()
+                        val result = candidate.probeOutboundUrl(url, 5_000, "proxy")
+                        candidate.stop()
+                        check(result.isReachable) { "candidate probe: ${result.failureKind} ${result.httpStatus ?: ""}" }
+                        Log.i("TeapodVlessInterop", "$name: candidate probe ${result.delayMs} ms")
+                    }
                 }
                 Log.i("TeapodVlessInterop", "$name: plain and inner-TLS payloads verified")
             } catch (error: Throwable) {
                 Log.e("TeapodVlessInterop", "$name failed", error)
-                failures.add(name + ": " + error.javaClass.simpleName)
+                failures.add(name + ": " + error.javaClass.simpleName + " " + error.message)
             }
         }
         check(failures.isEmpty()) { failures.joinToString("; ") }
     }
+
+    /** The harness's HTTP 204 endpoint, seen from the reference server on the host. */
+    private fun probeUrl(fixture: JSONObject): String? =
+        fixture.optInt("probePort").takeIf { it > 0 }?.let { "http://127.0.0.1:$it/generate_204" }
 
     private fun socks(port: Int, target: Int): Socket {
         val client = Socket("127.0.0.1", port)
@@ -102,8 +143,11 @@ class VlessTransportInteropTest {
         }
     }
 
-    /** SOCKS5 UDP ASSOCIATE; 3000 bytes exceed one 1200-byte QUIC datagram. */
-    private fun udpEcho(port: Int, target: Int) {
+    /**
+     * SOCKS5 UDP ASSOCIATE; 3000 bytes exceed one 1200-byte QUIC datagram. With
+     * [expectReply] false nothing may come back; a refused association also counts.
+     */
+    private fun socksUdp(port: Int, target: Int, expectReply: Boolean) {
         Socket("127.0.0.1", port).use { control ->
             control.soTimeout = 15000
             val out = control.getOutputStream()
@@ -111,7 +155,10 @@ class VlessTransportInteropTest {
             out.write(byteArrayOf(5, 1, 0))
             assertEquals(5, input.readUnsignedByte()); assertEquals(0, input.readUnsignedByte())
             out.write(byteArrayOf(5, 3, 0, 1, 0, 0, 0, 0, 0, 0))
-            assertEquals(5, input.readUnsignedByte()); assertEquals(0, input.readUnsignedByte())
+            assertEquals(5, input.readUnsignedByte())
+            val status = input.readUnsignedByte()
+            if (status != 0 && !expectReply) return
+            assertEquals(0, status)
             input.readUnsignedByte()
             val host = when (input.readUnsignedByte()) {
                 1 -> InetAddress.getByAddress(ByteArray(4).also { input.readFully(it) })
@@ -123,9 +170,9 @@ class VlessTransportInteropTest {
                 if (host.isAnyLocalAddress) InetAddress.getLoopbackAddress() else host,
                 input.readUnsignedShort())
             DatagramSocket().use { udp ->
-                udp.soTimeout = 5000
+                udp.soTimeout = if (expectReply) 5000 else 2000
                 val header = byteArrayOf(0, 0, 0, 1, 127, 0, 0, 1, (target shr 8).toByte(), target.toByte())
-                for (size in intArrayOf(64, 1000, 3000)) {
+                for (size in if (expectReply) intArrayOf(64, 1000, 3000) else intArrayOf(64)) {
                     val payload = ByteArray(size) { ((it * 31 + size) and 255).toByte() }
                     val datagram = header + payload
                     val buffer = ByteArray(65536)
@@ -142,6 +189,10 @@ class VlessTransportInteropTest {
                         reply = buffer.copyOf(packet.length)
                         break
                     }
+                    if (!expectReply) {
+                        check(reply == null) { "SOCKS UDP was relayed although UDP is off" }
+                        return
+                    }
                     val received = requireNotNull(reply) { "No UDP reply for $size bytes" }
                     check(received.size > 4 && received[2].toInt() == 0) { "Invalid SOCKS UDP reply" }
                     val offset = when (received[3].toInt()) {
@@ -153,6 +204,28 @@ class VlessTransportInteropTest {
                     assertArrayEquals(payload, received.copyOfRange(offset, received.size))
                 }
             }
+        }
+    }
+
+    /**
+     * One UDP flow from an app address through the TUN packet path to 127.0.0.1:[target]
+     * on the server's host. Blocked flows get no reply within two sends.
+     */
+    private fun tunUdp(core: XrayCore, sourcePort: Int, target: Int, expectReply: Boolean) {
+        val payload = ByteArray(200) { ((it * 13 + target) and 255).toByte() }
+        val packet = TunPackets.udp(TunPackets.client, sourcePort, TunPackets.loopback, target, payload)
+        var reply: ByteArray? = null
+        for (attempt in 0 until if (expectReply) 3 else 2) {
+            core.pushPacket(packet)
+            reply = TunPackets.await(core, 2_000) { p ->
+                TunPackets.parseUdp(p)?.takeIf { it.sourcePort == target && it.destinationPort == sourcePort }?.payload
+            }
+            if (reply != null) break
+        }
+        if (expectReply) {
+            assertArrayEquals("TUN UDP to port $target", payload, requireNotNull(reply) { "No TUN UDP reply from port $target" })
+        } else {
+            check(reply == null) { "TUN UDP to port $target was not blocked" }
         }
     }
 

@@ -18,6 +18,9 @@ live TUN counters (`tcp/udpRemoteRead/WrittenBytes`, `activeTcp/UdpFlows`,
 `tunFdRead/WriteLoopExits`) for traffic speed and the heartbeat watchdog.
 `TunStatsTest` (androidTest; no VPN permission or fixture needed) sends a UDP echo
 through the core's packet I/O and checks the appended fields while the flow is open.
+`TunAdmissionTest` uses the same packet I/O (`TunPackets`) to check the admission
+behaviour the app's owner check relies on. `VlessTransportInteropTest` runs only
+with the fixture from `scripts/test-rust-transports.py`.
 The C header is unchanged from upstream.
 
 The native core is built from the same commit without local patches. The former
