@@ -1,31 +1,97 @@
 # TeapodStream: Go and experimental Rust builds
 
 The default build uses Go/teapod-core. The separate Rust build uses
-**xray-rust 0.7.0** and its direct TUN file-descriptor backend.
+**xray-rust 0.8.1** and its direct TUN file-descriptor backend.
 Rust application ID: `com.teapodstream.rustprobe`. It installs alongside the original TeapodStream.
 No live VPN profile or credentials are bundled.
 
-## Rust support (1.6.6-rust.7)
+## Rust support (1.6.6-rust.8)
 
-- VLESS with `encryption=none` over TCP/RAW, WebSocket, HTTPUpgrade, gRPC,
-  XHTTP/SplitHTTP. TLS is supported on all these carriers; REALITY on TCP/RAW,
-  gRPC and XHTTP/SplitHTTP.
-- `xtls-rprx-vision` and `xtls-rprx-vision-udp443` work over TCP/RAW + REALITY.
-  With `encryption=none`, Vision is rejected on WS/HTTPUpgrade/gRPC/XHTTP.
-- TLS + Vision is deliberately gated: the pinned native TLS transport retains
-  outer TLS decoding in direct mode and the local reference test reproduces EOF
-  after the inner TLS handshake. Ordinary TLS without Vision and REALITY + Vision
-  passed the same payload test. No transport/crypto patch is applied here.
-- TLS certificate verification remains enabled. `pinSHA256` accepts SHA-256 of
-  the full DER certificate as hex (including colon-separated hex) or base64;
-  the Rust config uses `pinnedPeerCertSha256`. `allowInsecure` without a pin and
-  ECH are rejected.
-- XHTTP `auto` / `packet-up` / `stream-up` / `stream-one`, host/path/extra,
-  REALITY SNI, fingerprint, public key, short ID and spiderX.
-- Hysteria 2 (`hy2://`, `hysteria2://`) without Salamander or port hopping; see
-  [Hysteria 2 in the Rust build](#hysteria-2-in-the-rust-build-166-rust7).
-- Direct TUN, TCP/UDP, Android per-app inclusion/exclusion, existing reconnect
-  and TUN-sink kill-switch paths.
+Profiles come from share links. Anything outside this list is refused with an
+explanation before VPN startup; nothing is silently dropped.
+
+- VLESS with `encryption=none` and a UUID over TCP/RAW, WebSocket, HTTPUpgrade,
+  gRPC and XHTTP/SplitHTTP. TLS works on all of these carriers; REALITY on
+  TCP/RAW, gRPC and XHTTP. XHTTP `auto` / `packet-up` / `stream-up` /
+  `stream-one`, host/path/extra, REALITY SNI, fingerprint, public key, short ID
+  and spiderX are kept.
+- `xtls-rprx-vision` and `xtls-rprx-vision-udp443` over TCP/RAW with TLS or
+  REALITY. Vision over plain TLS works since xray-rust 0.8.0. On other carriers
+  the core refuses Vision before dialing, as Xray-core does.
+- Trojan over the same carriers, with TLS or REALITY. The core refuses
+  plaintext Trojan to a public server; the app refuses it for any server.
+  Trojan links do not read `allowInsecure`, so the certificate is verified
+  unless a pin is given.
+- VMess AEAD over the same carriers, with or without TLS. It needs a UUID
+  `id`. A link's `aid` is ignored, as in Go: no `alterId` is written and the
+  client always speaks AEAD. The cipher is the link's `scy` when it is
+  `auto`, `aes-128-gcm` or `chacha20-poly1305`; any other value (`none`,
+  `zero`, CFB) is sent as `auto`, which Go always sends. Neither build parses
+  the VMess JSON `fp` and `alpn` fields.
+- Shadowsocks 2022, TCP and UDP. Methods are `2022-blake3-aes-128-gcm` and
+  `-aes-256-gcm` (up to eight colon-separated identity keys) and
+  `-chacha20-poly1305` (one key). Each key must be padded standard base64, at
+  least as long as the method's key. UDP goes to the server over its own
+  protected socket.
+- Hysteria 2 (`hy2://`, `hysteria2://`), with Salamander (`obfs=salamander`,
+  4–4096-byte password) and port hopping (a port range/list or `mport`, up to
+  65,535 expanded ports, the core's default 30 s interval). The Rust builder
+  keeps the Go builder's FinalMask `udp` Salamander and
+  `quicParams.udpHop.ports` unchanged. Brutal, bandwidth, other QUIC overrides
+  and other `obfs` types are refused.
+  - Each QUIC connection carries up to 256 TCP streams and 128 UDP sessions
+    (the core default is 64/32); a further flow fails at once until one closes.
+  - UDP travels in 1200-byte QUIC datagrams and is fragmented above that.
+  - QUIC TLS is not shaped, so fingerprint and ALPN overrides are dropped.
+  - After a network change the carrier rebinds instead of reconnecting; see
+    below.
+- Also refused:
+  - Shadowsocks: AEAD-2017 methods, SIP003 plugins, the Outline `prefix`.
+  - VMess: a link `tls` other than `tls` or `none`, including `reality` and
+    case variants such as `TLS`. The parser takes only the exact `tls`, so
+    such a profile would go to the TLS port without TLS.
+  - Carriers: kcp, QUIC, h2, TCP `headerType=http`.
+  - Other: ECH, a link's own `fm` (FinalMask), raw Xray JSON.
+- TLS certificate verification stays on.
+  - `pinSHA256` is the SHA-256 of the full leaf certificate, as hex,
+    colon-separated hex or base64. Both builders write it as
+    `pinnedPeerCertSha256`.
+  - A pin wins over `allowInsecure`: such a profile is built with
+    `allowInsecure: false`, so only the pinned certificate is accepted.
+  - `allowInsecure` without a pin is refused.
+- Fragmentation splits the TLS ClientHello on TCP TLS/REALITY carriers
+  (FinalMask `tcp` fragment).
+  - Settings: packets must be `tlshello`; length up to 16384 bytes; pause up
+    to 1000 ms.
+  - The core drops a connection whose cut exceeds 4096 pieces or 10 s of
+    pauses. The builder caps `maxSplit` only when a 16 KiB hello could reach
+    those limits, so ordinary settings cut as in Go.
+  - Not applied, as in Go: QUIC (Hysteria 2, XHTTP h3) and carriers without TLS.
+  - Refused with an XHTTP `downloadSettings`.
+- Noise is sent as junk UDP datagrams before the first QUIC packet (FinalMask
+  `udp` noise).
+  - Applies to Hysteria 2 and to XHTTP with TLS `alpn=h3`. On Hysteria 2 it
+    goes after Salamander, so it stays unobfuscated, like Go's freedom noise.
+  - Limits: up to 4096 bytes and a 1000 ms pause.
+  - TCP carriers are unaffected, as in Go.
+  - A Shadowsocks profile with noise is refused: Go adds noise to its UDP, but
+    the core cannot. Noise is a global network setting, so connecting to such
+    a profile means turning it off there; the message says so.
+- UDP switch and QUIC blocking. A routing rule right after the DNS rules sends
+  matching UDP to a `blackhole`:
+  - QUIC blocking catches UDP/443 from TUN. It turns on with the toggle, and
+    automatically for `xtls-rprx-vision-udp443`, as Go blocks QUIC for Vision.
+  - Plain `xtls-rprx-vision` gets no automatic rule: the core answers its
+    UDP/443 with ICMP "port unreachable" itself, so apps fall back to TCP at
+    once, as with Go's tun2socks. With the toggle on, the rule drops that
+    UDP/443 silently instead.
+  - Turning UDP off catches all UDP from TUN and from the local SOCKS.
+    xray-rust parses SOCKS `udp: false` but does not enforce it.
+  - Port 53 still reaches DNS. The core's DNS module and the proxy's own
+    carrier (Hysteria QUIC, Shadowsocks UDP) are not affected.
+  - Go's tun2socks answers blocked UDP with ICMP "port unreachable". The
+    blackhole drops silently, so an app falls back from QUIC to TCP only after
+    its own timeout.
 - DNS through the VPN or direct. App queries always go to the core's DNS
   outbound, which answers A/AAAA through the DNS module with the selected
   server (other query types get an empty NOERROR). In direct mode the module
@@ -36,24 +102,56 @@ No live VPN profile or credentials are bundled.
   localhost:53, and the StaticOnly bootstrap has no system resolver. A custom
   DNS server given by name is resolved by Android into `dns.hosts` before TUN
   starts (presets carry their IP); without it StaticOnly returns SERVFAIL.
+  Android resolves every proxy server name (VLESS/VMess `vnext`, Trojan and
+  Shadowsocks `servers`, Hysteria, and an XHTTP `downloadSettings` address)
+  the same way, under one 5-second budget.
 - Ad blocking: the DNS outbound answers `geosite:category-ads-all` and
   `geosite:win-spy` (Go's list) with an empty NOERROR, as Go's
   `rcode://success` server does, which xray-rust rejects. It applies with
   FakeDNS and in direct DNS mode too; Go's direct mode skips ad blocking.
-  xray-rust 0.7.0 caps a config at 250,000 domain matchers shared by routing
-  and DNS-outbound rules, and ad blocking alone expands to about 187k
-  (category-ads-all 186,402 + win-spy 327 in the bundled snapshot). Ad blocking
-  together with a GeoSite rule on `cn`, `china-list` (about 111k each) or
-  `category-ads-all` is therefore rejected before VPN startup. category-ads-all
-  is also at 93% of the core's per-category cap of 200,000 entries: a
-  Loyalsoldier update growing it by about 7% would stop every ad-blocking start.
-- App selection is enforced only by Android's VPN UID ranges. The Rust core has
-  no per-flow owner check like Go's tun2socks validator, so in both split-tunnel
-  modes an app outside the VPN that binds a socket to `tun0` (SO_BINDTODEVICE,
-  kernel 5.7+) is not blocked, and the tethering toggle is disabled.
+  xray-rust (unchanged in 0.8.1) caps a config at 250,000 domain matchers
+  shared by routing and DNS-outbound rules, and ad blocking alone expands to
+  about 187k (category-ads-all 186,402 + win-spy 327 in the bundled snapshot).
+  Ad blocking together with a GeoSite rule on `cn`, `china-list` (about 111k
+  each) or `category-ads-all` is therefore rejected before VPN startup.
+  category-ads-all is also at 93% of the core's per-category cap of 200,000
+  entries: a Loyalsoldier update growing it by about 7% would stop every
+  ad-blocking start.
+- Per-flow owner check (the 1.6.4 protection) and the tethering toggle work
+  as in Go for TUN flows, using the core's TUN flow admission. Go's validator
+  rule is ported unchanged (`TunOwnerPolicy`).
+  - «ТОЛЬКО»: only the selected apps' flows pass. Flows without an owner
+    (tethered clients, or an app outside the VPN that binds a socket to
+    `tun0`) are refused.
+  - «КРОМЕ» with exclusions: flows without an owner are refused unless the
+    tethering toggle is on, as in Go.
+  - In other cases the check cannot refuse anything and is not installed.
+  - The core asks before a TCP flow opens its outbound and before UDP
+    (including DNS) is routed. The callback looks up the owner with
+    `getConnectionOwnerUid`.
+  - A lookup that throws allows the flow, as in Go. A lookup that stalls for
+    5 s, or a full admission queue (four workers, 64 jobs), refuses the flow:
+    TCP is reset, and a UDP tuple stays refused until it falls idle. Go would
+    wait instead; neither build admits an unchecked flow, so an excluded app
+    cannot flood the queue to get through. A legitimate burst of more than
+    about 68 pending decisions (every app reconnecting at once) can reset
+    fresh TCP flows; apps recover on their next connect.
+  - The check covers TUN flows only. The loopback SOCKS listener has no
+    login, because the core accepts only no-auth. Any app on the device,
+    excluded or unselected ones included, can find its port and send TCP or
+    UDP through it; in FULL/BYPASS routing that goes through the proxy and
+    reveals the server's exit IP. Go prevents this with random per-session
+    SOCKS credentials, on by default; a random port only slows a port scan.
+    The split-tunnel screen of the Rust build says so.
+  - Some OEMs report no owner even for an included app's socket bound to
+    `tun0`; that flow is dropped in «ТОЛЬКО», as Go drops it.
+  - While the check is installed, the core drops local ICMP. Otherwise it
+    answers pings itself, so the check is installed only when it can refuse
+    something.
 - GeoIP, GeoSite, domain suffixes, individual sites and Russian-service lists.
-  BYPASS sends matches directly; ONLY sends matches through VLESS. FULL disables
-  destination rules. The app selection is applied by Android before these rules.
+  BYPASS sends matches directly; ONLY sends matches through the proxy. FULL
+  disables destination rules. The app selection is applied by Android before
+  these rules.
 - The bundled Loyalsoldier databases are the checksum-pinned 202609082347 snapshot.
   The existing routing screen downloads updates. A complete candidate pair is
   validated through Rust before an atomic pointer selects it; failure retains
@@ -64,39 +162,223 @@ No live VPN profile or credentials are bundled.
   core's own lookups. Applications using their own encrypted DNS or cached real IPs
   may evade GeoSite matching; turn off their secure-DNS override and restart them
   after changing routing. FakeDNS returns IPv4 and suppresses AAAA in this mode.
-- Heartbeat: the SOCKS probe (custom `http://` and `https://` targets; HTTPS
-  runs TLS with certificate and hostname checks inside the SOCKS tunnel) and
-  PASSIVE. Liveness uses the core's live TUN counters: data counts as received
-  only when TCP/UDP remote read bytes grow, not when the core writes its own
-  DNS/FakeDNS answers, ICMP replies or TCP control packets. As in Go, an exited
-  TUN fd read/write loop reconnects, and the TUN stall watchdog runs the failure
-  action after 120 s without received data while at least 2 TUN flows are open.
-  For the watchdog only, TCP payload the outbound accepted also counts as
-  activity: xray-rust ACKs an app's upload locally, while Go's tun2socks
-  refreshes on every TUN write (including those ACKs), so a reply-less upload
-  over 2 minutes (HTTP/1.1 PUT, FTP STOR) would otherwise reconnect. UDP sends
-  never block and do not count; the probe-skip freshness check stays read-only.
-  PASSIVE runs only these checks, with no probe in the loop or on screen wake.
-  XRAYDELAY (in-core measurement) is gated and a stored XRAYDELAY is sent as SOCKS.
-- When failed heartbeats switch configurations, Rust checks candidates with a
-  TCP ping and considers only profiles it supports; Go measures them through a
-  temporary core instance.
+- Heartbeat probes: SOCKS, XRAYDELAY and PASSIVE.
+  - SOCKS: custom `http://` and `https://` targets. HTTPS runs TLS with
+    certificate and hostname checks inside the SOCKS tunnel.
+  - XRAYDELAY: one HTTP(S) GET inside the core through the proxy outbound
+    (`probeOutboundUrl`, 10 s), bypassing routing. In ONLY mode, where the
+    default outbound is direct, a dead proxy therefore cannot look alive.
+    URLs the core refuses (IPv6 literal, userinfo, fragment) fall back to the
+    SOCKS probe with one warning.
+  - PASSIVE runs only the TUN checks below, with no probe in the loop or on
+    screen wake.
+- Liveness comes from the core's live TUN counters.
+  - Data counts as received only when TCP/UDP remote read bytes grow. The
+    core's own DNS/FakeDNS answers, ICMP replies and TCP control packets do
+    not count.
+  - As in Go, an exited TUN fd read/write loop reconnects.
+  - The TUN stall watchdog runs the failure action after 120 s without
+    received data while at least 2 TUN flows are open.
+  - For the watchdog only, TCP payload the outbound accepted also counts as
+    activity. xray-rust ACKs an app's upload locally, while Go's tun2socks
+    refreshes on every TUN write (including those ACKs). Without this, a
+    reply-less upload longer than 2 minutes (HTTP/1.1 PUT, FTP STOR) would
+    trigger a reconnect.
+  - UDP sends never block and do not count. The probe-skip freshness check
+    stays read-only.
+- Network changes reconnect after the usual 2 s debounce. Hysteria 2
+  profiles rebind the QUIC carrier onto the new network instead.
+  - A follow-up check confirms the rebind: one GET through the proxy outbound
+    inside the core (5 s, bypassing routing), so a direct route or direct DNS
+    answer cannot pass for the proxy. It allows two attempts, 3 s apart.
+  - PASSIVE sends no probe: there any TUN data received after the rebind
+    counts, a direct route included, and a session without any reconnects.
+  - When the rebind throws or both checks fail, the app falls back to a full
+    reconnect.
+- switchConfig measures candidates through their protocol, as Go does.
+  - Each runs in a temporary core started from the production probe variant:
+    the candidate's exact proxy outbound plus a loopback SOCKS on an
+    ephemeral port.
+  - 5 s timeout, at most two at once; a queued candidate waits at most 20 s
+    for a slot, then counts as unmeasured. Their server lookups run on their
+    own two workers, so they never hold up the VPN's own start. The running
+    VpnService protects their sockets.
+  - A heartbeat URL the core refuses (IPv6 literal, userinfo, fragment,
+    upper-case scheme) is measured through the default
+    `http://cp.cloudflare.com/generate_204`.
+  - Only profiles the Rust build supports are considered.
 
-The Rust build requires MTU 1500, UDP enabled and QUIC blocking disabled.
-Proxy-only mode, raw Xray JSON, legacy mux and fragmentation (VLESS), noise and
-other proxy protocols are rejected with an error before VPN startup. ICMP
-handling is the Rust core's local synthetic behavior; it is not a remote ping
-measurement.
+Remaining limits. These controls stay visible but disabled, with the reason
+shown. Where a stored value would change the config (proxy-only mode, MTU,
+Mux, raw JSON, ECH), the builder also refuses it before VPN startup.
 
-Packet path: Android TUN → Rust userspace stack → VLESS/XHTTP/REALITY or Hysteria 2.
+| Setting | Why it stays off |
+| --- | --- |
+| SOCKS login/password | The core's SOCKS inbound is no-auth only, so any local app can use the listener while the VPN runs; app selection and the owner check do not cover it. |
+| Proxy-only mode | The unauthenticated SOCKS would be the only way into the tunnel. |
+| ICMP toggle | TUN-level behaviour with no config knob. The core answers pings locally, or drops them under the owner check. |
+| MTU other than 1500 | The TUN runtime path is verified only at 1500. |
+| Mux | The core has no VLESS mux, XHTTP needs `concurrency: -1`, and the core caps concurrency at 64 where the app allows 1024. |
+| ECH | Not implemented in the core. |
+| Raw Xray JSON, Observatory | Managed JSON is not supported. |
+| App update checks (upstream releases) | The Rust build is updated manually from the fork. |
+
+ICMP handling is the Rust core's local synthetic behavior; it is not a remote
+ping measurement.
+
+Packet path: Android TUN → Rust userspace stack → VLESS, Trojan, VMess,
+Shadowsocks 2022 or Hysteria 2.
 A no-auth SOCKS listener on `127.0.0.1` supports the app's heartbeat and IP check.
 Device TUN traffic does not traverse this listener. SOCKS credentials settings
-do not apply to this experimental build. Speed and totals come from the core's
+do not apply to this experimental build, so other apps, excluded ones
+included, can connect to it, unlike Go's default random credentials. Speed and totals come from the core's
 live TUN payload counters (bytes written to and read from outbounds, proxy and
 direct), not tun2socks IP-byte counters; the per-outbound snapshot in the
 diagnostics counts closed connections only.
 
+## xray-rust 0.8.1 (1.6.6-rust.8)
+
+The core moves from 0.7.0 to stable xray-rust v0.8.1, commit
+`5b61eee201fac8639cb1dac0349e34af65db90f7`, built without local changes. The
+C ABI goes from 1.7 to 1.12, adding to the existing interface without breaking
+it.
+
+Most features below shipped in 0.8.0. Version 0.8.1 itself adds only the
+Apple startup-probe preflight (ABI 1.12, unused on Android) and dependency
+updates; protocol and config formats are unchanged. rust.7 ran on 0.7.0,
+which had none of these features.
+
+Upstream requests now used by the app:
+
+- PR #48, Vision direct mode beneath plain TLS: TLS + Vision is enabled.
+- PR #49, the on-demand outbound URL probe (released as ABI 1.9): the
+  XRAYDELAY heartbeat and switchConfig measurement through the protocol.
+- PR #50, the `blackhole` outbound: QUIC blocking and the UDP switch.
+- Issue #51, TUN flow admission (ABI 1.11): the per-flow owner check and the
+  tethering toggle.
+- Issue #52, ClientHello fragmentation and UDP noise: both network settings.
+- Issue #53, Hysteria 2 Salamander, port hopping, raisable stream budgets
+  (ABI 1.10) and Kotlin rebind: these Hysteria 2 profiles, 256/128 streams,
+  and rebinding on network changes.
+- The maintainer's PR #42: Trojan, Shadowsocks 2022 and VMess AEAD.
+
+Fixes that change both builds:
+
+- Trojan links now keep `security` (`reality`/`none`), the REALITY keys
+  (`pbk`, `sid`, `spx`, `pqv`), `pinSHA256`, `alpn` and `ech`. All of these
+  were silently dropped before.
+- Percent-encoded SIP002 Shadowsocks keys are now decoded; `%2B`/`%3D` used to
+  stay inside the key.
+- Percent-encoded Trojan passwords are now decoded (`p%40ss%3A1` is
+  `p@ss:1`), as v2rayN and v2rayNG read them; they used to reach the server
+  encoded. A stray `%` leaves the password as given.
+
+Rust-only changes:
+
+- The WebSocket `Host` header is written as `host`. This removes a
+  deprecation warning the core printed for every WebSocket profile.
+- With UDP off, the blackhole rule also covers the local SOCKS, because
+  xray-rust accepts UDP ASSOCIATE despite `udp: false`.
+
+The Go build's behaviour is otherwise unchanged.
+
+Device interop harness. `scripts/test-rust-transports.py` exports production
+configs through the parser and the Rust builder, then runs them on the emulator
+against the pinned Xray-core 26.7.28. Every case runs:
+
+- plain and inner-TLS echo through SOCKS;
+- the in-core XRAYDELAY probe;
+- the switchConfig candidate probe.
+
+It has 32 cases in groups:
+
+| Group | Cases |
+| --- | --- |
+| `vless` | 8 carrier/security combinations. |
+| `vision` | Both Vision flows over TLS and over REALITY. |
+| `trojan` | TCP/TLS with SOCKS UDP, WebSocket/TLS, TCP/REALITY. |
+| `vmess` | TCP/TLS with ChaCha20 and SOCKS UDP; WebSocket/TLS with `auto`. |
+| `ss` | Each SS2022 method plus an AES identity-key chain, TCP and SOCKS UDP. |
+| `hysteria` | Pin; `insecure=1` + pin; Salamander; noise; Salamander + noise; each with SOCKS UDP. |
+| `fragment` | ClientHello fragmentation over TCP/TLS, TCP/REALITY and REALITY + Vision. |
+| `udp` | Hysteria 2 with UDP on, QUIC blocked, and UDP off (below). |
+
+The `udp` cases send UDP packets through the TUN packet path to a UDP echo
+and to port 443. The server redirects port 443 to the same echo, so a missing
+reply proves the client's rule dropped the packet. A VMess link has no pin
+field, so the exporter pins the test certificate on the parsed profile.
+
+Environment flags:
+
+- `TEAPOD_INTEROP_GROUPS=trojan,ss` and `TEAPOD_INTEROP_CASES=name,…` select
+  cases. `TEAPOD_INTEROP_VISION_ONLY=1` and `TEAPOD_INTEROP_HYSTERIA_ONLY=1`
+  still work.
+- `TEAPOD_INTEROP_CHECK_ONLY=1` runs without a device. It checks the server
+  config with `xray run -test` and every exported VPN and probe config with
+  `xray-rust config check`. Set `XRAY_RUST_CLI` when the host CLI is not at
+  `.native/host-cli-0.8.1/xray-rust`; a device run also does this check when
+  the CLI exists.
+- `TEAPOD_INTEROP_WORKDIR=dir` keeps the generated configs and `xray.log`.
+
+```sh
+TEAPOD_INTEROP_CHECK_ONLY=1 python3 scripts/test-rust-transports.py
+JAVA_HOME=/path/to/jdk17 ANDROID_SERIAL=emulator-5554 \
+  TEAPOD_INTEROP_GROUPS=trojan,vmess,ss python3 scripts/test-rust-transports.py
+```
+
+`TunAdmissionTest` (xraymobile androidTest, needs no fixture or VPN permission)
+checks the admission behaviour the owner check relies on. It uses synthetic
+app packets through the core's packet I/O and confirms that:
+
+- the callback sees the app's own tuple;
+- a denied UDP datagram never reaches its target;
+- a denied TCP flow is reset before its outbound opens;
+- a Java exception in the callback denies;
+- a timeout allows only with `failOpen` (the app passes `failOpen = false`);
+- local ICMP is answered without a policy and dropped with one.
+
+```sh
+cd android
+JAVA_HOME=/path/to/jdk17 ./gradlew :xraymobile:connectedDebugAndroidTest \
+  -Pdart-defines=VEVBUE9EX0NPUkU9cnVzdA== \
+  -Pandroid.testInstrumentationRunnerArguments.class=org.xrayrust.mobile.TunAdmissionTest
+```
+
+The owner rule itself is covered by JVM tests (`android/app/src/testRust`,
+`:app:testReleaseUnitTest` with `TEAPOD_CORE=rust`).
+
+Verification for 1.6.6-rust.8:
+
+- 204 Flutter tests passed in each build mode; analysis has only the three
+  existing `onReorder` deprecation infos; the 6 JVM `TunOwnerPolicyTest`
+  cases pass (owner decision checked against the Go validator).
+- Every Rust config the production builder exported (all protocols,
+  transports, security, routing modes, DNS presets, fragmentation, noise,
+  QUIC/UDP blocking; 1,395 built, 340 refused as expected) was accepted by
+  `xray-rust config check` 0.8.1, as built and with Android's server-address
+  resolution applied, except REALITY with the `android` fingerprint (no
+  X25519 key share). The probe configs started in the host core.
+- On the API 36 emulator, all 32 interop cases passed against Xray-core
+  26.7.28 (groups vless, vision, hysteria, trojan, vmess, ss, fragment, udp):
+  plain and inner-TLS echo, SOCKS and TUN UDP checks, the in-core probe and
+  the temporary-core candidate probe. The 6 GeoIP/GeoSite tests, the TUN
+  counter test and the 4 `TunAdmissionTest` cases passed.
+- The release APK installed over rust.7 kept its profile. Through the
+  installed APK's TUN, a different UID (shell, 2000) downloaded and
+  SHA-256-verified 8 MiB over Trojan TLS and over Shadowsocks 2022; the
+  server logs show the flows on the Trojan and Shadowsocks inbounds. UI
+  disconnects removed `tun0`.
+- Release APKs keep the earlier signing certificate, raise the version code
+  (12611/14611), pass 16 KiB alignment checks and package the newly built
+  xray-rust 0.8.1 core (compared after symbol stripping).
+- Not covered: owner check and Hysteria rebind on a phone (Wi-Fi ↔ LTE,
+  OEM UID visibility), screen-off soak, and the remaining no-auth loopback
+  SOCKS exposure (upstream aimalygin/xray-rust#80 adds SOCKS passwords).
+
 ## Hysteria 2 in the Rust build (1.6.6-rust.7)
+
+As of rust.7, on xray-rust 0.7.0. rust.8 lifts the Salamander, port-hopping,
+noise and 64/32-stream limits below; see the support list above.
 
 - `hy2://` / `hysteria2://` profiles run on the core's Hysteria 2 client:
   `protocol: hysteria`, stock QUIC TLS with ALPN `h3`, password auth (1–4096
@@ -189,7 +471,7 @@ For direct Flutter commands, prepare dependencies first:
 ./build-rust.sh binaries
 flutter build apk --release --dart-define=TEAPOD_CORE=rust \
   --target-platform android-arm64,android-x64 --split-per-abi \
-  --build-name=1.6.6-rust.7 --build-number=10610
+  --build-name=1.6.6-rust.8 --build-number=10611
 
 # Native Android binding tests use the same base64-encoded Flutter flag.
 cd android
@@ -405,7 +687,7 @@ remain to be measured; the emulator result is a functional smoke test.
 
 Import a VLESS share link in the app, approve the Android VPN request, and test
 web browsing, DNS/UDP, screen-off resume, reconnect and disconnect. In the
-diagnostic snapshot, `engine` must be `xray-rust 0.7.0` and `tunBackend` must be
+diagnostic snapshot, `engine` must be `xray-rust 0.8.1` and `tunBackend` must be
 `fd`; incoming and outgoing packet counters should increase with app traffic.
 
 Compare energy against the original app on the same phone, server, network and
@@ -414,7 +696,7 @@ workload. Desktop/emulator tests cannot establish a battery-life improvement.
 ## Dependencies
 
 - [xray-rust source](https://github.com/aimalygin/xray-rust), MPL-2.0.
-- [Pinned source v0.7.0](https://github.com/aimalygin/xray-rust/tree/67969094b352f948c6b8b9e2ac75402c577cb7f7), unmodified;
+- [Pinned source v0.8.1](https://github.com/aimalygin/xray-rust/tree/5b61eee201fac8639cb1dac0349e34af65db90f7), unmodified;
   [third-party notices](third_party/xray-rust/THIRD_PARTY_NOTICES.md), including the vendored GotaTun WireGuard engine.
 - [Bundled geodata snapshot](https://github.com/Loyalsoldier/v2ray-rules-dat/releases/tag/202609082347).
 - Upstream TeapodStream retains its existing license.
