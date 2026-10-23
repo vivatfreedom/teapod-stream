@@ -61,7 +61,8 @@ class XrayEngine implements VpnEngine {
       'allowIcmp': options.allowIcmp,
       'blockQuic': options.blockQuic,
       'ipv6Enabled': options.ipv6Enabled,
-      // Rust has no per-flow owner check, so the switch has nothing to control.
+      // Both services check flow owners in TUN (Go: tun2socks validator,
+      // Rust: xray-rust TUN admission), so the switch applies in both builds.
       'allowTethering':
           CoreFeatures.current.supports(CoreFeature.tetheringControl) &&
           options.allowTethering,
@@ -82,12 +83,15 @@ class XrayEngine implements VpnEngine {
   }
 
   /// Замер задержки через кандидата: временный xray-инстанс с его конфигом
-  /// (`Teapodcore.measureOutboundDelay`). null — сервер не ответил.
-  /// В Rust-сборке временного инстанса нет: null без обращения к native.
+  /// (Go: `Teapodcore.measureOutboundDelay`; Rust: временное ядро без TUN с
+  /// [RustConfigBuilder.buildProbeJson]). null — сервер не ответил или профиль
+  /// с этими настройками не собирается.
   Future<int?> measureOutbound(VpnConfig config, VpnEngineOptions options, String url) async {
     if (!CoreFeatures.current.supports(CoreFeature.outboundDelayProbe)) return null;
     try {
-      final xrayConfig = config.rawXrayConfig != null
+      final xrayConfig = CoreFeatures.current.isRust
+          ? RustConfigBuilder.buildProbeJson(config, options)
+          : config.rawXrayConfig != null
           ? XrayConfigBuilder.mergeWithRaw(config.rawXrayConfig!, options)
           : XrayConfigBuilder.buildJson(config, options);
       return await _channel.invokeMethod<int>('measureOutbound', {

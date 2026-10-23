@@ -68,28 +68,19 @@ void main() {
   AppSettings settingsOf(ProviderContainer container) =>
       container.read(settingsProvider).requireValue;
 
-  testWidgets('a stored XRAYDELAY probe follows the selected core', (
+  testWidgets('a stored XRAYDELAY probe is kept in both cores', (
     tester,
   ) async {
     final container = await pumpScreen(tester, HeartbeatProbe.xrayDelay);
-    final reason = CoreFeatures.rust.unavailableReason(
-      CoreFeature.coreDelayProbe,
-    )!;
     expect(find.text('XRAYDELAY'), findsOneWidget);
-    // Go measures the URL in the core; Rust replaces XRAYDELAY with the SOCKS
-    // probe — both need the target URL.
+    // Both cores measure the URL in the core through the proxy.
     expect(find.text('Адрес проверки'), findsOneWidget);
-    if (!CoreFeatures.current.isRust) {
-      expect(find.text(reason), findsNothing);
-      expect(find.text(reset), findsNothing);
-      return;
-    }
-    expect(find.text(reason), findsOneWidget);
-    await tester.tap(find.text(reset));
-    await tester.pumpAndSettle();
-    expect(settingsOf(container).heartbeat.probe, HeartbeatProbe.socks);
-    expect(find.text(reason), findsNothing);
-    expect(find.text('SOCKS'), findsOneWidget);
+    expect(find.text(reset), findsNothing);
+    expect(settingsOf(container).heartbeat.probe, HeartbeatProbe.xrayDelay);
+    expect(
+      find.textContaining('XRAYDELAY — '),
+      findsOneWidget,
+    );
   });
 
   testWidgets('PASSIVE is supported by both cores and needs no target URL', (
@@ -113,10 +104,7 @@ void main() {
     await tester.tap(find.text('SOCKS'));
     await tester.pumpAndSettle();
     expect(find.text('heartbeat // probe'), findsOneWidget);
-    expect(
-      find.text('XRAYDELAY'),
-      CoreFeatures.current.isRust ? findsNothing : findsOneWidget,
-    );
+    expect(find.text('XRAYDELAY'), findsOneWidget);
     expect(find.text('PASSIVE'), findsOneWidget);
   });
 
@@ -140,12 +128,13 @@ void main() {
       scrollable: find.byType(Scrollable).first,
     );
     expect(
-      find.textContaining('TCP-пингом, а не замером'),
-      CoreFeatures.current.isRust ? findsOneWidget : findsNothing,
-    );
-    expect(
       find.textContaining('полноценным замером через сам протокол, не TCP-пингом'),
-      CoreFeatures.current.isRust ? findsNothing : findsOneWidget,
+      findsOneWidget,
+    );
+    // Rust takes only the profiles its builder can run.
+    expect(
+      find.textContaining('поддерживает Rust-сборка'),
+      CoreFeatures.current.isRust ? findsOneWidget : findsNothing,
     );
   });
 }

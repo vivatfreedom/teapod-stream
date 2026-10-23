@@ -77,8 +77,8 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
 
   void _update(AppSettings s) => ref.read(settingsProvider.notifier).save(s);
 
-  /// XRAYDELAY есть только в Go. Сохранённое неподдерживаемое значение
-  /// остаётся видно с объяснением и явным сбросом на SOCKS-пробу.
+  /// Проба, которую сборка не поддерживает (сейчас оба ядра умеют все три),
+  /// остаётся видна с объяснением и явным сбросом на SOCKS-пробу.
   Widget _heartbeatProbeGate(AppSettings s, bool locked, Widget child) {
     final feature = CoreFeatures.heartbeatProbeFeature(s.heartbeat.probe);
     if (feature == null) return child;
@@ -348,7 +348,9 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
                         child: SetRowToggle(
                           t: t,
                           title: 'UDP',
-                          hint: 'Разрешить UDP-трафик через SOCKS',
+                          hint: CoreFeatures.current.isRust
+                              ? 'Разрешить UDP из приложений (TUN) и через SOCKS. Выключенный UDP Rust-ядро отбрасывает молча; DNS (порт 53) работает и без него'
+                              : 'Разрешить UDP-трафик через SOCKS',
                           value: s.enableUdp,
                           locked: locked,
                           onChange: (v) => _update(s.copyWith(enableUdp: v)),
@@ -373,8 +375,9 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
                         child: SetRowToggle(
                           t: t,
                           title: 'Блокировать QUIC',
-                          hint:
-                              'TUN отвечает на UDP 443 ICMP-ом "порт недоступен": браузер мгновенно падает на TCP вместо ожидания QUIC-таймаута (~55с). Трафик из устройства не уходит.',
+                          hint: CoreFeatures.current.isRust
+                              ? 'UDP 443 из TUN отбрасывается правилом ядра молча: ICMP «порт недоступен», как в Go-сборке, не отправляется, поэтому браузер переходит на TCP по своему таймауту QUIC. Трафик из устройства не уходит. При выключенном переключателе на UDP 443 профиля с xtls-rprx-vision ядро само сразу отвечает ICMP «порт недоступен»; с xtls-rprx-vision-udp443 блокировка включается автоматически, как в Go.'
+                              : 'TUN отвечает на UDP 443 ICMP-ом "порт недоступен": браузер мгновенно падает на TCP вместо ожидания QUIC-таймаута (~55с). Трафик из устройства не уходит.',
                           value: s.blockQuic,
                           locked: locked,
                           onChange: (v) => _update(s.copyWith(blockQuic: v)),
@@ -489,8 +492,9 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
                             SetRowToggle(
                               t: t,
                               title: 'Фрагментация',
-                              hint:
-                                  'Режет исходящий TCP-поток на части, чтобы DPI не собрал ClientHello целиком. Не применяется к Hysteria2 (QUIC поверх UDP).',
+                              hint: CoreFeatures.current.isRust
+                                  ? 'Режет TLS ClientHello на части, чтобы DPI не собрал его целиком: только пакеты tlshello, TCP с TLS/Reality, длина до 16384 байт, пауза до 1000 мс (всего не больше 10 с — при длинной паузе последний кусок длиннее). Без TLS и для QUIC (Hysteria2, xHTTP h3) не применяется.'
+                                  : 'Режет исходящий TCP-поток на части, чтобы DPI не собрал ClientHello целиком. Не применяется к Hysteria2 (QUIC поверх UDP).',
                               value: s.fragment.enabled,
                               locked: locked,
                               onChange: (v) =>
@@ -560,8 +564,9 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
                             SetRowToggle(
                               t: t,
                               title: 'Шумы',
-                              hint:
-                                  'Мусорные UDP-датаграммы перед первой полезной. Работают только на UDP-плече — Hysteria2 и QUIC-транспорт; на TCP не влияют (там фрагментация). DNS-запросы xray шумом не портит.',
+                              hint: CoreFeatures.current.isRust
+                                  ? 'Мусорные UDP-датаграммы перед первым QUIC-пакетом: только Hysteria2 и xHTTP поверх HTTP/3 (alpn h3), до 4096 байт, пауза до 1000 мс. На TCP-транспорт не влияют; профиль Shadowsocks с шумами не запустится — его UDP Rust-ядро не зашумляет.'
+                                  : 'Мусорные UDP-датаграммы перед первой полезной. Работают только на UDP-плече — Hysteria2 и QUIC-транспорт; на TCP не влияют (там фрагментация). DNS-запросы xray шумом не портит.',
                               value: s.noise.enabled,
                               locked: locked,
                               onChange: (v) =>
@@ -710,7 +715,7 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
                           t: t,
                           title: 'Тип проверки',
                           hint: CoreFeatures.current.isRust
-                              ? 'SOCKS — HTTP(S)-запрос через локальный SOCKS5 в xray-rust; PASSIVE — без активных проб, только счётчики TUN Rust-ядра (экономит батарею, обрыв виден лишь при реальном трафике). XRAYDELAY есть только в Go-сборке'
+                              ? 'SOCKS — HTTP(S)-запрос через локальный SOCKS5 в xray-rust; XRAYDELAY — запрос внутри Rust-ядра прямо через прокси-выход, мимо маршрутизации, сразу даёт задержку; PASSIVE — без активных проб, только счётчики TUN Rust-ядра (экономит батарею, обрыв виден лишь при реальном трафике)'
                               : 'SOCKS — HTTP-запрос через SOCKS5 в xray; XRAYDELAY — замер внутри ядра, сразу даёт задержку; PASSIVE — без активных проб, только метрики tun2socks (экономит батарею, обрыв виден лишь при реальном трафике)',
                           value: s.heartbeat.probe.name.toUpperCase(),
                           locked: locked,
@@ -725,8 +730,7 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
                           ),
                         ),
                       ),
-                      // Адрес нужен любой активной пробе; в Rust сохранённый XRAYDELAY
-                      // заменяется SOCKS-пробой, которая стучится по этому адресу.
+                      // Адрес нужен любой активной пробе.
                       if (CoreFeatures.current.effectiveHeartbeatProbe(s.heartbeat.probe) !=
                           HeartbeatProbe.passive) ...[
                         _PickerRow(
@@ -800,7 +804,8 @@ class _NetworkSettingsScreenState extends ConsumerState<NetworkSettingsScreen> {
                           t: t,
                           title: 'Откуда брать конфиг',
                           hint: 'SUBSCRIPTION — конфиги той же подписки; PINNED — закреплённые; ALL — все сохранённые. '
-                              '${CoreFeatures.current.unavailableReason(CoreFeature.outboundDelayProbe) ?? 'Кандидаты проверяются полноценным замером через сам протокол, не TCP-пингом'}',
+                              'Кандидаты проверяются полноценным замером через сам протокол, не TCP-пингом'
+                              '${CoreFeatures.current.isRust ? '; берутся только профили, которые поддерживает Rust-сборка' : ''}',
                           value: s.heartbeat.switchSource.name.toUpperCase(),
                           locked: locked,
                           onTap: () => _showEnumPicker<SwitchSource>(

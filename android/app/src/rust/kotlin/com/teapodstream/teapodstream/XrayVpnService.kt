@@ -20,6 +20,9 @@ import android.os.PowerManager
 import android.system.OsConstants
 import android.util.LruCache
 import androidx.core.app.NotificationCompat
+import org.xrayrust.mobile.XrayCoreException
+import org.xrayrust.mobile.XrayTunAdmissionOptions
+import org.xrayrust.mobile.XrayTunFlowAdmission
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -64,7 +67,7 @@ class XrayVpnService : VpnService() {
         const val EXTRA_IPV6 = "ipv6_enabled" // add IPv6 address/route to the TUN interface
         const val EXTRA_ALLOW_TETHERING = "allow_tethering" // allExcept: let unowned (tethered) flows in
         const val EXTRA_MTU = "mtu" // TUN MTU size
-        const val EXTRA_HEARTBEAT_PROBE = "heartbeat_probe"      // "socks" | "xrayDelay" | "passive" (Rust: socks | passive)
+        const val EXTRA_HEARTBEAT_PROBE = "heartbeat_probe"      // "socks" | "xrayDelay" | "passive"
         const val EXTRA_HEARTBEAT_ACTION = "heartbeat_action"    // "reconnect" | "switchConfig" (старое имя "urltest")
         const val EXTRA_HEARTBEAT_THRESHOLD = "heartbeat_threshold" // провалов подряд до действия
         const val EXTRA_HEARTBEAT_URL = "heartbeat_url"          // куда стучится проба
@@ -168,6 +171,19 @@ class XrayVpnService : VpnService() {
         private const val STATS_INTERVAL_SCREEN_OFF_MS = 10_000L
         private const val STOP_THREAD_TIMEOUT_MS = 5_000L
         private const val RECONNECT_DEBOUNCE_MS = 2_000L
+        // After a Hysteria carrier rebind: how long Quinn gets for path validation
+        // before each check, and how many failed checks fall back to a full reconnect.
+        private const val REBIND_VERIFY_DELAY_MS = 3_000L
+        private const val REBIND_VERIFY_ATTEMPTS = 2
+        // One in-core probe through the proxy leaf per rebind check.
+        private const val REBIND_PROBE_TIMEOUT_MS = 5_000L
+        // The owner lookup is one binder call. Go's validator waits for it without a
+        // limit; 5 s is the core's maximum, and only a stalled system_server or a full
+        // admission queue reach it — then the flow is refused (TCP reset, new UDP flow
+        // dropped), so no flow passes unchecked, as in Go.
+        private const val TUN_ADMISSION_TIMEOUT_MS = 5_000
+        // XrayStatus INVALID_ARGUMENT (xray_ffi.h): the probe URL, tag or timeout.
+        private const val XRAY_STATUS_INVALID_ARGUMENT = 9
         // Failed CONNECT_QUICK reconnects are retried with linear backoff instead of
         // silently leaving the VPN off (and, with kill switch, traffic leaking).
         private const val MAX_RECONNECT_ATTEMPTS = 3
@@ -248,9 +264,12 @@ class XrayVpnService : VpnService() {
     private var pendingNetworkRunnable: Runnable? = null
     private var heartbeatThread: Thread? = null
     private val heartbeatFailures = AtomicInteger(0)
-    // Чем щупаем туннель: "socks" (HTTP/HTTPS через SOCKS5) или "passive" (только
-    // счётчики TUN, без активных проб). xrayDelay сводится к socks в applyHeartbeatProbe().
+    // Чем щупаем туннель: "socks" (HTTP/HTTPS через SOCKS5), "xrayDelay" (запрос
+    // внутри ядра через прокси-выход) или "passive" (только счётчики TUN, без проб).
     private var heartbeatProbe: String = "socks"
+    // XRAYDELAY-URL, который ядро не принимает (IPv6-литерал, userinfo, фрагмент):
+    // до конца сессии проба идёт через SOCKS, предупреждение — один раз.
+    @Volatile private var coreProbeUrlRejected = false
     // Запрошенная, но неподдерживаемая проба — пишется в лог один раз при старте VPN.
     @Volatile private var unsupportedHeartbeatProbe: String? = null
     // Поведение при мёртвом туннеле: "reconnect" — переподключить тот же сервер,
@@ -258,9 +277,12 @@ class XrayVpnService : VpnService() {
     private var heartbeatAction: String = "reconnect"
     private var heartbeatThreshold: Int = 3
     private var heartbeatUrl: String = DEFAULT_HEARTBEAT_URL
-    // В Go-сборке пропускает потоки без владельца в allExcept. Rust-ядро потоки по
-    // владельцу не фильтрует — значение только сохраняется в ConnectionParams.
+    // allExcept: пропускать потоки без владельца (раздача точки доступа), как в Go.
     @Volatile private var allowTethering = false
+    // Проверка владельца потоков текущей сессии; null — хук в ядре не нужен.
+    @Volatile private var tunOwnerPolicy: TunOwnerPolicy? = null
+    // Поколение смены сети: новая смена отменяет проверку после прошлого rebind.
+    private val networkChangeGeneration = AtomicInteger(0)
     private var lastTunnelDeadNotifyAt = 0L
     private val wakeProbeRunning = AtomicBoolean(false)
     private val reconnectAttempts = AtomicInteger(0)
@@ -539,9 +561,9 @@ class XrayVpnService : VpnService() {
         // После clearLogFile(), чтобы причина подмены пробы осталась в логе этой сессии.
         unsupportedHeartbeatProbe?.let {
             unsupportedHeartbeatProbe = null
-            log("warning", "Heartbeat probe \"$it\" не поддерживается Rust-ядром " +
-                "(нет замера внутри ядра), используется socks")
+            log("warning", "Heartbeat probe \"$it\" неизвестен, используется socks")
         }
+        coreProbeUrlRejected = false
 
         try {
             require(!proxyOnly) { "Rust-пробник поддерживает только TUN" }
@@ -634,18 +656,18 @@ class XrayVpnService : VpnService() {
                     log("info", "TUN established with IP $dynamicTunIp")
                 }
 
-                // Go-сборка отбрасывает потоки без владельца (uid=-1: тетеринг или приложение
-                // вне VPN, привязавшее сокет к TUN): в «ТОЛЬКО» всегда, в «КРОМЕ» при
-                // исключениях без allowTethering. xray-rust читает TUN fd сам, проверки
-                // владельца потока в нём нет — честно пишем об этом, без имитации фильтра.
-                if (vpnMode == "onlySelected" || excludedPackages.isNotEmpty()) {
-                    log("info", "Split tunnel ($vpnMode): per-flow owner filtering is unavailable in the Rust core, " +
-                        "apps outside the VPN that bind to tun0 are not blocked" +
-                        if (vpnMode == "onlySelected") "" else " (allowTethering=$allowTethering has no effect)")
-                }
+                // Split tunneling at the TUN level, as Go's tun2socks validator: flows
+                // without an owner (uid=-1: tethering, or an app outside the VPN that
+                // bound its socket to tun0) are dropped in «ТОЛЬКО» always and in «КРОМЕ»
+                // when there are exclusions and tethering is off (1.6.4 leak fix).
+                val allowedUids = resolveUids(vpnMode, includedPackages, excludedPackages)
+                val ownerPolicy = TunOwnerPolicy.of(vpnMode, allowedUids, excludedPackages, allowTethering)
+                tunOwnerPolicy = ownerPolicy.takeIf { it.needsAdmission }
+                log("info", "TUN owner check: mode=$vpnMode uids=${allowedUids.size} " +
+                    "blockUnowned=${ownerPolicy.blockUnowned} admission=${ownerPolicy.needsAdmission}")
 
                 // Rust borrows the Android fd and handles IP packets directly.
-                startXrayAndWait(finalConfig)
+                startXrayAndWait(finalConfig, tunOwnerPolicy?.let(::tunAdmission))
                 if (userRequestedDisconnect.get()) {
                     stopVpn(explicit = true)
                     return
@@ -688,8 +710,68 @@ class XrayVpnService : VpnService() {
         }
     }
 
-    private fun startXrayAndWait(config: String) {
-        RustCore.start(config, this, requireNotNull(tunInterface).fd)
+    private fun startXrayAndWait(config: String, admission: XrayTunAdmissionOptions? = null) {
+        RustCore.start(config, this, requireNotNull(tunInterface).fd, admission)
+    }
+
+    /**
+     * Resolves UIDs for the given package lists based on vpnMode — the same lists as
+     * the Go service. In "onlySelected" mode returns allowed UIDs; otherwise returns
+     * excluded UIDs (including the app's own UID to prevent routing loops).
+     */
+    private fun resolveUids(
+        vpnMode: String,
+        includedPackages: List<String>,
+        excludedPackages: List<String>,
+    ): Set<Int> {
+        val uids = mutableSetOf<Int>()
+        val packages = if (vpnMode == "onlySelected") includedPackages else excludedPackages
+        for (pkg in packages) {
+            try {
+                val uid = packageManager.getPackageUid(pkg, PackageManager.GET_META_DATA)
+                uids.add(uid)
+                log("info", "${if (vpnMode == "onlySelected") "Allowed" else "Excluded"} UID for $pkg: $uid")
+            } catch (e: Exception) {
+                log("warning", "Failed to get UID for $pkg: ${e.message}")
+            }
+        }
+
+        try {
+            val ownUid = packageManager.getPackageUid(packageName, PackageManager.GET_META_DATA)
+            if (vpnMode == "onlySelected") {
+                if (uids.remove(ownUid)) {
+                    log("info", "Removed own UID ($ownUid) from Allowed list to prevent loop")
+                }
+            } else {
+                uids.add(ownUid)
+                log("info", "Excluded own UID ($packageName): $ownUid")
+            }
+        } catch (e: Exception) {
+            log("warning", "Failed to resolve own UID: ${e.message}")
+        }
+
+        return uids
+    }
+
+    /**
+     * xray-rust asks before a new TCP flow opens its outbound and before UDP (DNS and
+     * FakeDNS included) is routed, with the original app tuple, on up to four native
+     * workers. Like Go, the callback looks up the owner itself and allows a flow
+     * whose lookup threw; exceptions escaping to the core would deny. A decision past
+     * the 5 s timeout, or a full admission queue (four workers, 64 jobs), refuses the
+     * flow: with failOpen an excluded app could flood the queue and get unchecked
+     * flows through the proxy. Some OEMs report INVALID_UID even for an included
+     * app's socket bound to tun0: that flow is dropped in «ТОЛЬКО», as Go drops it.
+     */
+    private fun tunAdmission(policy: TunOwnerPolicy): XrayTunAdmissionOptions {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        return XrayTunAdmissionOptions(
+            callback = XrayTunFlowAdmission { flow ->
+                policy.admitFlow { cm.getConnectionOwnerUid(flow.protocol, flow.source, flow.destination) }
+            },
+            timeoutMs = TUN_ADMISSION_TIMEOUT_MS,
+            failOpen = false,
+        )
     }
 
     /**
@@ -781,6 +863,9 @@ class XrayVpnService : VpnService() {
         log("info", "stopVpn: begin (explicit=$explicit, reconnecting=$reconnecting)")
         stopHeartbeat()
         tunModeActive = false
+        tunOwnerPolicy?.let { if (it.denied > 0) log("info", "TUN owner check refused ${it.denied} flow(s)") }
+        tunOwnerPolicy = null
+        networkChangeGeneration.incrementAndGet()
         lastUnderlyingNetwork = null
         lastConnectedMs = 0L
         pendingNetworkRunnable?.let { networkChangeHandler.removeCallbacks(it) }
@@ -1117,11 +1202,88 @@ class XrayVpnService : VpnService() {
             log("debug", "Network change: ignored (VPN just connected ${msSinceConnect}ms ago)")
             return
         }
-        log("info", "Network change: reconnect scheduled in ${RECONNECT_DEBOUNCE_MS}ms")
+        val rebind = RustCore.usesHysteria()
+        log("info", "Network change: ${if (rebind) "Hysteria rebind" else "reconnect"} scheduled in ${RECONNECT_DEBOUNCE_MS}ms")
         pendingNetworkRunnable?.let { networkChangeHandler.removeCallbacks(it) }
-        val r = Runnable { reconnectInternal() }
+        val r = Runnable { if (rebind) rebindHysteria() else reconnectInternal() }
         pendingNetworkRunnable = r
         networkChangeHandler.postDelayed(r, RECONNECT_DEBOUNCE_MS)
+    }
+
+    /**
+     * Hysteria2 instead of a full reconnect: the underlying network is already
+     * selected (updateUnderlyingNetworks), so the core moves its QUIC carrier to a
+     * fresh protected socket and keeps the session; the server address pinned at
+     * start stays. Falls back to reconnectInternal() when the core cannot rebind or
+     * the tunnel does not come back (verifyAfterRebind).
+     */
+    private fun rebindHysteria() {
+        if (userRequestedDisconnect.get() || !isRunning.get()) return
+        val generation = networkChangeGeneration.incrementAndGet()
+        Thread {
+            // Sample the counters first: under PASSIVE only data read after this point
+            // proves the new path.
+            RustCore.lastRxActivityMs()
+            val rebindAt = System.currentTimeMillis()
+            val accepted = try {
+                RustCore.rebindHysteria()
+            } catch (e: Exception) {
+                log("warning", "Hysteria rebind unavailable (${e.message}), reconnecting")
+                reconnectInternal()
+                return@Thread
+            }
+            log("info", "Network change: Hysteria carrier rebind requested (accepted=$accepted)")
+            verifyAfterRebind(generation, rebindAt)
+        }.also { it.isDaemon = true; it.start() }
+    }
+
+    /**
+     * The rebind count is acceptance, not recovery. After a short path-validation
+     * window, one GET through the proxy leaf inside the core (RustCore.probeProxy,
+     * bypassing routing) must pass: TUN data or the SOCKS probe could come from a
+     * direct route or direct DNS while Hysteria stays dead. Reconnects, as the old
+     * network-change path did, when both checks fail. PASSIVE sends no probe: there
+     * any TUN data received after the rebind counts, and a session without any
+     * reconnects.
+     */
+    private fun verifyAfterRebind(generation: Int, rebindAt: Long) {
+        val passive = heartbeatProbe == "passive"
+        repeat(REBIND_VERIFY_ATTEMPTS) { attempt ->
+            try { Thread.sleep(REBIND_VERIFY_DELAY_MS) } catch (_: InterruptedException) { return }
+            if (generation != networkChangeGeneration.get() || !isRunning.get()
+                || userRequestedDisconnect.get()) return
+            val failure = if (passive) {
+                if (RustCore.lastRxActivityMs() > rebindAt) null else "no TUN data"
+            } else {
+                probeProxyAfterRebind()
+            }
+            if (failure == null) {
+                log("info", "Hysteria rebind: ${if (passive) "TUN traffic flows" else "proxy path alive"}")
+                return
+            }
+            log("warning", "Hysteria rebind check ${attempt + 1}/$REBIND_VERIFY_ATTEMPTS failed: $failure")
+        }
+        if (generation != networkChangeGeneration.get()) return
+        log("warning", "Hysteria rebind did not restore the tunnel, reconnecting")
+        reconnectInternal()
+    }
+
+    /** Null when one GET through the proxy leaf succeeds, else why it failed. */
+    private fun probeProxyAfterRebind(): String? = try {
+        val url = if (coreProbeUrlRejected) DEFAULT_HEARTBEAT_URL else heartbeatUrl
+        val result = try {
+            RustCore.probeProxy(url, REBIND_PROBE_TIMEOUT_MS)
+        } catch (e: IllegalArgumentException) {
+            RustCore.probeProxy(DEFAULT_HEARTBEAT_URL, REBIND_PROBE_TIMEOUT_MS)
+        } catch (e: XrayCoreException) {
+            // A URL the core refuses (as in measureXrayDelay): probe the default target.
+            if (e.code != XRAY_STATUS_INVALID_ARGUMENT) throw e
+            RustCore.probeProxy(DEFAULT_HEARTBEAT_URL, REBIND_PROBE_TIMEOUT_MS)
+        }
+        if (result.delayMs != null) null
+        else "${result.failureKind?.wireValue}${result.httpStatus?.let { " $it" } ?: ""}"
+    } catch (e: Exception) {
+        e.message ?: e.javaClass.simpleName
     }
 
     private fun reconnectInternal() {
@@ -1289,7 +1451,8 @@ class XrayVpnService : VpnService() {
                         if (stats.isNotEmpty()) {
                             val lastRx = RustCore.lastRxActivityMs()
                             val lastRxSec = if (lastRx > 0) (System.currentTimeMillis() - lastRx) / 1000 else -1
-                            log("debug", "tun stats: $stats lastRxSec=$lastRxSec")
+                            val denied = tunOwnerPolicy?.let { " ownerDenied=${it.denied}" } ?: ""
+                            log("debug", "tun stats: $stats lastRxSec=$lastRxSec$denied")
                         }
                     }
                     // Detect TUN-layer stall: SOCKS5 heartbeat bypasses TUN entirely,
@@ -1391,18 +1554,18 @@ class XrayVpnService : VpnService() {
         heartbeatFailures.set(0)
     }
 
-    /// Rust-ядро умеет socks и passive. Замера внутри ядра (xrayDelay) у xray-rust нет;
-    /// passive, как в Go, держится на проверке TUN и stall watchdog по счётчикам ядра.
-    /// Dart в Rust-сборке xrayDelay не шлёт; если он пришёл (старые ConnectionParams),
-    /// сводим к socks и пишем в лог.
+    /// socks, xrayDelay и passive — как в Go. xrayDelay меряет URL внутри ядра через
+    /// прокси-выход (probeOutboundUrl); passive держится на проверке TUN и stall
+    /// watchdog по счётчикам ядра. Неизвестное значение сводится к socks с записью в лог.
     private fun applyHeartbeatProbe(requested: String?) {
-        heartbeatProbe = if (requested == "passive") "passive" else "socks"
-        unsupportedHeartbeatProbe = requested?.takeIf { it.isNotEmpty() && it != "socks" && it != "passive" }
+        val (probe, unknown) = heartbeatProbeOf(requested)
+        heartbeatProbe = probe
+        unsupportedHeartbeatProbe = unknown
     }
 
     /// Разбор URL пробы: хост, порт и путь с query. Пресеты плоские (http), но
-    /// кастомный URL пользователь может задать любой. Go меряет https-URL внутри
-    /// ядра; у xray-rust такого API нет, поэтому TLS поднимаем сами поверх SOCKS5.
+    /// кастомный URL пользователь может задать любой. Go меряет https-URL SOCKS-пробы
+    /// внутри ядра; здесь TLS поднимаем сами поверх SOCKS5, как и прежде.
     /// null — URL не годится (не http/https или без хоста).
     private data class ProbeUrl(val host: String, val port: Int, val path: String, val https: Boolean)
 
@@ -1427,11 +1590,50 @@ class XrayVpnService : VpnService() {
         }
     }
 
-    /// Активная проба: HTTP или HTTPS через SOCKS5. Пассивный режим не зовёт её ни
-    /// в цикле, ни при пробуждении. Бросает исключение при неудаче — heartbeat-цикл
-    /// считает это провалом.
+    /// Активная проба выбранного типа. Пассивный режим не зовёт её ни в цикле, ни
+    /// при пробуждении. Бросает исключение при неудаче — heartbeat-цикл считает это
+    /// провалом, как в Go.
     private fun runProbe(port: Int) {
+        when (heartbeatProbe) {
+            "passive" -> return   // сюда не доходим: цикл не вызывает пробу вовсе
+            "xrayDelay" -> if (!coreProbeUrlRejected) {
+                measureXrayDelay(port)
+                return
+            }
+        }
         checkTunnelConnectivity(port)
+    }
+
+    /// Go: Teapodcore.measureXrayDelay(url) < 0 — провал. Здесь — один GET через
+    /// прокси-выход работающего ядра, мимо маршрутизации (в «ТОЛЬКО» выход по
+    /// умолчанию — direct), не дольше HEARTBEAT_PROBE_TIMEOUT_MS. URL, который ядро
+    /// не принимает (IPv6-литерал, userinfo, фрагмент), переводит пробу на SOCKS.
+    private fun measureXrayDelay(port: Int) {
+        val result = try {
+            RustCore.probeProxy(heartbeatUrl)
+        } catch (e: IllegalArgumentException) {
+            rejectCoreProbeUrl(e.message)
+            return checkTunnelConnectivity(port)
+        } catch (e: XrayCoreException) {
+            if (e.code != XRAY_STATUS_INVALID_ARGUMENT) throw e
+            rejectCoreProbeUrl(e.message)
+            return checkTunnelConnectivity(port)
+        }
+        val delay = result.delayMs
+        if (delay == null) {
+            val status = result.httpStatus?.let { " $it" } ?: ""
+            log("warning", "Heartbeat check failed [xray delay]: ${result.failureKind?.wireValue}$status")
+            throw Exception("xray delay probe failed: ${result.failureKind?.wireValue}$status")
+        }
+        heartbeatFailures.set(0)
+        log("debug", "Heartbeat OK (xray delay ${delay}ms)")
+    }
+
+    private fun rejectCoreProbeUrl(reason: String?) {
+        if (coreProbeUrlRejected) return
+        coreProbeUrlRejected = true
+        log("warning", "XRAYDELAY: Rust-ядро не принимает URL \"$heartbeatUrl\" ($reason), " +
+            "до конца сессии проба идёт через SOCKS")
     }
 
     private fun checkTunnelConnectivity(port: Int) {

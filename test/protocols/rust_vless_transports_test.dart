@@ -46,23 +46,20 @@ void main() {
         }
       });
     }
-    if (security == 'reality') {
-      for (final flow in RustConfigBuilder.visionFlows) {
-        test('preserves $flow over TCP + $security', () {
-          final config = VlessParser.parseUri(
-            link('tcp', security, flow: flow),
-          )!;
-          final json = RustConfigBuilder.build(config, options);
-          final outbound = (json['outbounds'] as List).first;
-          expect(outbound['settings']['vnext'][0]['users'][0]['flow'], flow);
-          expect(outbound['streamSettings']['network'], 'tcp');
-          expect(
-            outbound['streamSettings'].containsKey('xhttpSettings'),
-            isFalse,
-          );
-          expect(outbound.containsKey('mux'), isFalse);
-        });
-      }
+    // xray-rust 0.8.0 fixed Vision direct mode beneath plain TLS on RAW.
+    for (final flow in RustConfigBuilder.visionFlows) {
+      test('preserves $flow over TCP + $security', () {
+        final config = VlessParser.parseUri(link('tcp', security, flow: flow))!;
+        final json = RustConfigBuilder.build(config, options);
+        final outbound = (json['outbounds'] as List).first;
+        expect(outbound['settings']['vnext'][0]['users'][0]['flow'], flow);
+        expect(outbound['streamSettings']['network'], 'tcp');
+        expect(
+          outbound['streamSettings'].containsKey('xhttpSettings'),
+          isFalse,
+        );
+        expect(outbound.containsKey('mux'), isFalse);
+      });
     }
   }
 
@@ -82,10 +79,11 @@ void main() {
     for (final uri in [
       link('ws', 'reality'),
       link('httpupgrade', 'reality'),
-      for (final t in ['ws', 'grpc', 'httpupgrade', 'xhttp'])
-        link(t, 'tls', flow: 'xtls-rprx-vision'),
-      for (final flow in RustConfigBuilder.visionFlows)
-        link('tcp', 'tls', flow: flow),
+      for (final security in ['tls', 'reality'])
+        for (final t in ['ws', 'grpc', 'httpupgrade', 'xhttp'])
+          link(t, security, flow: 'xtls-rprx-vision'),
+      link('tcp', 'tls', extra: '&headerType=http'),
+      link('tcp', 'tls', extra: '&ech=AEX%2B'),
       link('tcp', 'none'),
       link('kcp', 'tls'),
       link('quic', 'tls'),
@@ -114,18 +112,46 @@ void main() {
     expect(tls['allowInsecure'], isFalse);
   });
 
-  test('Vision does not force the unsupported host QUIC flag in Rust', () {
-    expect(
-      CoreFeatures.rust.effectiveQuicBlock(requested: false, usesVision: true),
-      isFalse,
-    );
-    expect(
-      CoreFeatures.go.effectiveQuicBlock(requested: false, usesVision: true),
-      isTrue,
-    );
-    expect(
-      CoreFeatures.rust.effectiveQuicBlock(requested: true, usesVision: true),
-      isTrue,
-    );
+  test('Vision over TLS keeps its flow and leaves UDP/443 to the core', () {
+    for (final flow in RustConfigBuilder.visionFlows) {
+      final config = VlessParser.parseUri(link('tcp', 'tls', flow: flow))!;
+      expect(RustConfigBuilder.unsupportedReason(config), isNull);
+      final json = RustConfigBuilder.build(
+        config,
+        VpnEngineOptions(
+          socksPort: 10808,
+          httpPort: 0,
+          socksUser: '',
+          socksPassword: '',
+          blockQuic: CoreFeatures.rust.effectiveQuicBlock(
+            requested: false,
+            flow: config.flow,
+          ),
+        ),
+      );
+      final outbound = (json['outbounds'] as List).first;
+      expect(outbound['settings']['vnext'][0]['users'][0]['flow'], flow);
+      expect(outbound['streamSettings']['security'], 'tls');
+      final rules = json['routing']['rules'] as List;
+      final outbounds = json['outbounds'] as List;
+      if (flow == 'xtls-rprx-vision') {
+        // The core answers plain-Vision UDP/443 with ICMP port unreachable
+        // itself; a blackhole rule would turn that into a silent drop.
+        expect(rules.where((dynamic r) => r['outboundTag'] == 'block'), isEmpty);
+        expect(
+          outbounds.where((dynamic o) => o['protocol'] == 'blackhole'),
+          isEmpty,
+        );
+      } else {
+        // -udp443 gets the QUIC block, as in Go.
+        expect(rules.last, {
+          'type': 'field',
+          'inboundTag': ['tun-in'],
+          'network': 'udp',
+          'port': '443',
+          'outboundTag': 'block',
+        });
+      }
+    }
   });
 }

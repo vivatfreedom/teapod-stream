@@ -169,7 +169,7 @@ class MainActivity : FlutterActivity() {
                         val url = call.argument<String>("url") ?: ""
                         Thread {
                             val latency = try {
-                                CoreBridge.measureOutboundDelay(config, url)
+                                CoreBridge.measureOutboundDelay(applicationContext, config, url)
                             } catch (e: Exception) {
                                 -1L
                             }

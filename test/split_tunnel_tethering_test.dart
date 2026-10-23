@@ -73,58 +73,50 @@ bool _switchValue(WidgetTester tester) => tester
     )
     .value;
 
-const _onlySelectedNotice = 'Rust-ядро не проверяет владельца потоков TUN: '
-    'невыбранное приложение, привязавшее сокет к tun0, не блокируется '
-    '(Go-сборка такие потоки отбрасывает).';
-
 void main() {
-  final reason = CoreFeatures.rust.unavailableReason(
-    CoreFeature.tetheringControl,
-  )!;
-
-  testWidgets('tethering switch follows the selected core', (tester) async {
+  // Both services check the owner of every new TUN flow (Go: tun2socks
+  // validator, Rust: xray-rust TUN admission), so the screen is the upstream one.
+  testWidgets('the tethering switch controls unowned flows in both cores', (
+    tester,
+  ) async {
     final container = await _pumpScreen(
       tester,
       _allExcept(allowTethering: true),
     );
 
     expect(find.text('Раздача через VPN'), findsOneWidget);
-    expect(find.textContaining('Защита ослаблена'), findsOneWidget);
-    if (!CoreFeatures.current.isRust) {
-      expect(find.text(reason), findsNothing);
-      await tester.tap(find.text('Раздача через VPN'));
-      await tester.pumpAndSettle();
-      expect(container.read(settingsProvider).requireValue.allowTethering, isFalse);
-      expect(find.textContaining('Защита ослаблена'), findsNothing);
-      return;
-    }
-
-    expect(find.text(reason), findsOneWidget);
-    // No stored value changes what Rust does, so there is nothing to reset.
-    expect(find.text('Сбросить неподдерживаемое значение'), findsNothing);
-    // The switch is inert and shows what the core does: unowned flows always pass.
-    await tester.tap(find.text('Раздача через VPN'), warnIfMissed: false);
-    await tester.pumpAndSettle();
-    expect(container.read(settingsProvider).requireValue.allowTethering, isTrue);
     expect(_switchValue(tester), isTrue);
     expect(find.textContaining('Защита ослаблена'), findsOneWidget);
+    await tester.tap(find.text('Раздача через VPN'));
+    await tester.pumpAndSettle();
+    expect(container.read(settingsProvider).requireValue.allowTethering, isFalse);
+    expect(_switchValue(tester), isFalse);
+    expect(find.textContaining('Защита ослаблена'), findsNothing);
   });
 
-  testWidgets('Rust warns even when tethering is stored as off', (tester) async {
-    await _pumpScreen(tester, _allExcept(allowTethering: false));
-
-    final rust = CoreFeatures.current.isRust;
-    // Rust never blocks unowned flows, so the protected state is not shown.
-    expect(_switchValue(tester), rust);
-    expect(
-      find.textContaining('Защита ослаблена'),
-      rust ? findsOneWidget : findsNothing,
+  testWidgets('tethering stored as off shows the protected state', (
+    tester,
+  ) async {
+    final container = await _pumpScreen(
+      tester,
+      _allExcept(allowTethering: false),
     );
-    expect(find.text(reason), rust ? findsOneWidget : findsNothing);
+
+    expect(_switchValue(tester), isFalse);
+    expect(find.textContaining('Защита ослаблена'), findsNothing);
     expect(find.text('Сбросить неподдерживаемое значение'), findsNothing);
+    expect(find.textContaining('не проверяет владельца'), findsNothing);
+
+    // Turning it on still asks first, as upstream.
+    await tester.tap(find.text('Раздача через VPN'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Включить'));
+    await tester.pumpAndSettle();
+    expect(container.read(settingsProvider).requireValue.allowTethering, isTrue);
+    expect(find.textContaining('Защита ослаблена'), findsOneWidget);
   });
 
-  testWidgets('Rust explains the missing owner check in ТОЛЬКО mode', (
+  testWidgets('ТОЛЬКО mode needs no tethering switch or owner-check notice', (
     tester,
   ) async {
     await _pumpScreen(
@@ -137,9 +129,31 @@ void main() {
     );
 
     expect(find.text('Раздача через VPN'), findsNothing);
-    expect(
-      find.text(_onlySelectedNotice),
-      CoreFeatures.current.isRust ? findsOneWidget : findsNothing,
-    );
+    expect(find.textContaining('не проверяет владельца'), findsNothing);
   });
+
+  // The owner check covers TUN only; Rust's loopback SOCKS takes no password.
+  for (final (name, settings, shown) in [
+    ('КРОМЕ', _allExcept(allowTethering: false), true),
+    (
+      'ТОЛЬКО',
+      const AppSettings(
+        splitTunnelingEnabled: true,
+        vpnMode: VpnMode.onlySelected,
+        includedPackages: {'org.example.browser'},
+      ),
+      true,
+    ),
+    ('split tunnelling off', const AppSettings(), false),
+  ]) {
+    testWidgets('Rust explains that its SOCKS is open to every app: $name', (
+      tester,
+    ) async {
+      await _pumpScreen(tester, settings);
+      expect(
+        find.textContaining('локальный SOCKS работает без пароля'),
+        shown && CoreFeatures.current.isRust ? findsOneWidget : findsNothing,
+      );
+    });
+  }
 }

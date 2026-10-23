@@ -18,7 +18,7 @@ String connectionFingerprint(AppSettings s) {
     'blockQuic': s.blockQuic,
     'mtu': s.mtu,
     'ipv6Enabled': s.ipv6Enabled,
-    // Rust не управляет раздачей: в native всегда уходит false (см. XrayEngine).
+    // Неподдерживаемая раздача в native уходит как false (см. XrayEngine).
     'allowTethering':
         CoreFeatures.current.supports(CoreFeature.tetheringControl) &&
         s.allowTethering,

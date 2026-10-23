@@ -1,8 +1,7 @@
-import '../../core/constants/core_features.dart';
-import '../widgets/feature_gate.dart';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../core/constants/core_features.dart';
 import '../../core/models/app_info.dart';
 import '../../core/services/settings_service.dart';
 import '../../providers/app_icon_provider.dart';
@@ -90,9 +89,6 @@ class _SplitTunnelScreenState extends ConsumerState<SplitTunnelScreen> {
 
     final modeLabel = isOnlySelected ? 'ONLY' : 'EXCEPT';
     final countStr = packages.length.toString().padLeft(2, '0');
-    // Rust не блокирует потоки без владельца: раздача фактически всегда разрешена.
-    final ownerCheck = CoreFeatures.current.supports(CoreFeature.tetheringControl);
-    final tetheringAllowed = (settings?.allowTethering ?? false) || !ownerCheck;
 
     return Scaffold(
       body: SafeArea(
@@ -201,25 +197,19 @@ class _SplitTunnelScreenState extends ConsumerState<SplitTunnelScreen> {
             if (settings != null &&
                 settings.splitTunnelingEnabled &&
                 settings.vpnMode == VpnMode.allExcept) ...[
-              // Rust не проверяет владельца потоков TUN: переключателю нечем управлять.
-              // Показываем фактическое состояние (потоки без владельца проходят);
-              // сбрасывать нечего — ни одно сохранённое значение его не меняет.
-              FeatureGate(
-                feature: CoreFeature.tetheringControl,
-                child: SetRowToggle(
-                  t: t,
-                  title: 'Раздача через VPN',
-                  hint: 'Пускать в туннель трафик точки доступа',
-                  value: tetheringAllowed,
-                  onChange: (v) async {
-                    if (v && !await _confirmTethering(t)) return;
-                    ref
-                        .read(settingsProvider.notifier)
-                        .save(settings.copyWith(allowTethering: v));
-                  },
-                ),
+              SetRowToggle(
+                t: t,
+                title: 'Раздача через VPN',
+                hint: 'Пускать в туннель трафик точки доступа',
+                value: settings.allowTethering,
+                onChange: (v) async {
+                  if (v && !await _confirmTethering(t)) return;
+                  ref
+                      .read(settingsProvider.notifier)
+                      .save(settings.copyWith(allowTethering: v));
+                },
               ),
-              if (tetheringAllowed)
+              if (settings.allowTethering)
                 Container(
                   width: double.infinity,
                   padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
@@ -230,16 +220,17 @@ class _SplitTunnelScreenState extends ConsumerState<SplitTunnelScreen> {
                   ),
                 ),
             ],
-            // В «ТОЛЬКО» Go-сборка тоже отбрасывает потоки без владельца; в Rust этой
-            // проверки нет ни в одном режиме, настройки для неё нет — только пояснение.
+            // Rust: проверка владельца закрывает только TUN, а локальный SOCKS
+            // без пароля (другого xray-rust не принимает) открыт всем приложениям.
             if (settings != null &&
                 settings.splitTunnelingEnabled &&
-                settings.vpnMode == VpnMode.onlySelected &&
-                !ownerCheck)
+                !CoreFeatures.current.supports(CoreFeature.socksAuthentication))
               Padding(
                 padding: const EdgeInsets.fromLTRB(20, 4, 20, 12),
                 child: Text(
-                  'Rust-ядро не проверяет владельца потоков TUN: невыбранное приложение, привязавшее сокет к tun0, не блокируется (Go-сборка такие потоки отбрасывает).',
+                  'Rust: локальный SOCKS работает без пароля и доступен любому приложению на устройстве, '
+                  'в том числе исключённому или невыбранному: через него оно может выйти в VPN и узнать IP сервера. '
+                  'Проверка владельца потоков TUN и раздача на это не влияют.',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ),

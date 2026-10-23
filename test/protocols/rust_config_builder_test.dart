@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:teapodstream/core/interfaces/vpn_engine.dart';
 import 'package:teapodstream/core/models/dns_config.dart';
 import 'package:teapodstream/core/models/routing_settings.dart';
+import 'package:teapodstream/core/models/xray_tuning.dart';
 import 'package:teapodstream/protocols/xray/rust_config_builder.dart';
 import 'package:teapodstream/protocols/xray/vless_parser.dart';
 import 'package:teapodstream/protocols/xray/xray_config_builder.dart';
@@ -462,7 +463,7 @@ void main() {
     ]);
   });
 
-  test('the tethering switch does not affect the Rust config', () {
+  test('the tethering switch is applied by the service, not the Rust config', () {
     final config = VlessParser.parseUri(profile())!;
     expect(
       RustConfigBuilder.buildJson(config, options(allowTethering: true)),
@@ -480,12 +481,30 @@ void main() {
     final config = VlessParser.parseUri(profile())!;
     for (final opts in [
       options(proxyOnly: true),
-      options(blockQuic: true),
+      const VpnEngineOptions(
+        socksPort: 12345,
+        httpPort: 0,
+        socksUser: '',
+        socksPassword: '',
+        mtu: 1400,
+      ),
+      const VpnEngineOptions(
+        socksPort: 12345,
+        httpPort: 0,
+        socksUser: '',
+        socksPassword: '',
+        mux: MuxSettings(enabled: true),
+      ),
     ]) {
       expect(
         () => RustConfigBuilder.build(config, opts),
         throwsFormatException,
       );
     }
+    // QUIC blocking is supported since xray-rust 0.8 (blackhole outbound).
+    expect(
+      () => RustConfigBuilder.build(config, options(blockQuic: true)),
+      returnsNormally,
+    );
   });
 }

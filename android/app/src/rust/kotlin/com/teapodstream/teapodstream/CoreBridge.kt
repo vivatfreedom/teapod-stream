@@ -11,7 +11,8 @@ internal object CoreBridge {
         GeodataStore.activate(context, revision)
         return prepare(context)
     }
-    // Замер кандидата для switchConfig поднимает временный инстанс Go-ядра; у xray-rust
-    // такого API нет, и Dart в Rust-сборке его не вызывает. -1 — «не измерено».
-    fun measureOutboundDelay(config: String, url: String): Long = -1L
+    // Замер кандидата для switchConfig: временный инстанс xray-rust без TUN с
+    // probe-конфигом кандидата (RustConfigBuilder.buildProbeJson). -1 — не ответил.
+    fun measureOutboundDelay(context: Context, config: String, url: String): Long =
+        RustCore.measureCandidate(context, config, url)
 }

@@ -39,6 +39,8 @@ android {
     }
 
     sourceSets.getByName("main").java.srcDir(if (rustCore) "src/rust/kotlin" else "src/go/kotlin")
+    // JVM tests of the Rust service's pure policies; the Go service has none.
+    if (rustCore) sourceSets.getByName("test").java.srcDir("src/testRust/kotlin")
 
     packaging {
         jniLibs {
@@ -67,6 +69,7 @@ android {
 dependencies {
     if (rustCore) implementation(project(":xraymobile"))
     else implementation(files("libs/teapod-core.aar"))
+    if (rustCore) testImplementation("junit:junit:4.13.2")
 }
 
 flutter {

@@ -15,6 +15,15 @@ void main() {
       CoreFeature.directDns,
       CoreFeature.adBlocking,
       CoreFeature.passiveHeartbeat,
+      // xray-rust 0.8.1: blackhole routing, FinalMask fragment and noise.
+      CoreFeature.quicBlocking,
+      CoreFeature.udpToggle,
+      CoreFeature.fragmentation,
+      CoreFeature.noise,
+      // xray-rust 0.8.1: probeOutboundUrl, temporary candidate cores, TUN admission.
+      CoreFeature.coreDelayProbe,
+      CoreFeature.outboundDelayProbe,
+      CoreFeature.tetheringControl,
     ]) {
       expect(CoreFeatures.rust.supports(feature), isTrue, reason: feature.name);
       expect(CoreFeatures.rust.unavailableReason(feature), isNull);
@@ -22,25 +31,50 @@ void main() {
     for (final feature in [
       CoreFeature.proxyOnly,
       CoreFeature.mux,
-      CoreFeature.quicBlocking,
-      CoreFeature.udpToggle,
       CoreFeature.socksAuthentication,
       CoreFeature.customMtu,
+      CoreFeature.icmpToggle,
+      CoreFeature.observatory,
+      CoreFeature.rawConfig,
     ]) {
       expect(CoreFeatures.rust.supports(feature), isFalse);
       expect(CoreFeatures.rust.unavailableReason(feature), isNotEmpty);
     }
   });
 
-  test('Rust gates XRAYDELAY, tethering and candidate measurement', () {
-    for (final feature in [
-      CoreFeature.coreDelayProbe,
-      CoreFeature.tetheringControl,
-      CoreFeature.outboundDelayProbe,
-    ]) {
-      expect(CoreFeatures.go.supports(feature), isTrue, reason: feature.name);
-      expect(CoreFeatures.rust.supports(feature), isFalse, reason: feature.name);
-      expect(CoreFeatures.rust.unavailableReason(feature), isNotEmpty);
+  test('Go blocks QUIC on the TUN side for every Vision flow', () {
+    const go = CoreFeatures.go;
+    for (final flow in ['xtls-rprx-vision', 'xtls-rprx-vision-udp443']) {
+      expect(go.effectiveQuicBlock(requested: false, flow: flow), isTrue);
+    }
+    for (final flow in [null, '']) {
+      expect(go.effectiveQuicBlock(requested: false, flow: flow), isFalse);
+      expect(go.effectiveQuicBlock(requested: true, flow: flow), isTrue);
+    }
+  });
+
+  test('Rust leaves plain-Vision UDP/443 to the core\'s ICMP reply', () {
+    const rust = CoreFeatures.rust;
+    // The core answers plain Vision UDP/443 with ICMP port unreachable; a
+    // blackhole rule would turn that into a silent drop.
+    expect(
+      rust.effectiveQuicBlock(requested: false, flow: 'xtls-rprx-vision'),
+      isFalse,
+    );
+    // -udp443 is blocked as in Go.
+    expect(
+      rust.effectiveQuicBlock(
+        requested: false,
+        flow: 'xtls-rprx-vision-udp443',
+      ),
+      isTrue,
+    );
+    for (final flow in [null, '']) {
+      expect(rust.effectiveQuicBlock(requested: false, flow: flow), isFalse);
+    }
+    // The user's toggle blocks QUIC for any profile.
+    for (final flow in [null, 'xtls-rprx-vision', 'xtls-rprx-vision-udp443']) {
+      expect(rust.effectiveQuicBlock(requested: true, flow: flow), isTrue);
     }
   });
 
@@ -52,29 +86,19 @@ void main() {
     }
   });
 
-  test('Rust offers SOCKS and PASSIVE and normalizes XRAYDELAY to SOCKS', () {
-    expect(CoreFeatures.rust.heartbeatProbes, [
-      HeartbeatProbe.socks,
-      HeartbeatProbe.passive,
-    ]);
+  test('Rust offers every heartbeat probe and keeps it as stored', () {
+    expect(CoreFeatures.rust.heartbeatProbes, HeartbeatProbe.values);
     expect(CoreFeatures.heartbeatProbeFeature(HeartbeatProbe.socks), isNull);
-    for (final probe in [HeartbeatProbe.socks, HeartbeatProbe.passive]) {
+    for (final probe in HeartbeatProbe.values) {
       expect(CoreFeatures.rust.supportsHeartbeatProbe(probe), isTrue);
       expect(CoreFeatures.rust.effectiveHeartbeatProbe(probe), probe);
     }
+  });
+
+  test('the Rust ICMP note covers the drop under the owner check', () {
     expect(
-      CoreFeatures.rust.supportsHeartbeatProbe(HeartbeatProbe.xrayDelay),
-      isFalse,
-    );
-    expect(
-      CoreFeatures.rust.effectiveHeartbeatProbe(HeartbeatProbe.xrayDelay),
-      HeartbeatProbe.socks,
-    );
-    expect(
-      CoreFeatures.rust.unavailableReason(
-        CoreFeatures.heartbeatProbeFeature(HeartbeatProbe.xrayDelay)!,
-      ),
-      isNotEmpty,
+      CoreFeatures.rust.unavailableReason(CoreFeature.icmpToggle),
+      contains('отбрасывается'),
     );
   });
 

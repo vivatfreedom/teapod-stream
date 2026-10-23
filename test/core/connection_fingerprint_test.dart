@@ -1,5 +1,4 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:teapodstream/core/constants/core_features.dart';
 import 'package:teapodstream/core/models/heartbeat_settings.dart';
 import 'package:teapodstream/core/models/connection_fingerprint.dart';
 import 'package:teapodstream/core/services/settings_service.dart';
@@ -53,18 +52,12 @@ void main() {
       final socks = withProbe(HeartbeatProbe.socks);
       final tethering = base.copyWith(allowTethering: true);
       final noTethering = base.copyWith(allowTethering: false);
-      // PASSIVE доходит до native в обеих сборках: смена пробы меняет сессию.
+      // Все три пробы и переключатель раздачи доходят до native в обеих сборках:
+      // их смена меняет сессию.
       expect(connectionFingerprint(passive), isNot(connectionFingerprint(socks)));
-      if (CoreFeatures.current.isRust) {
-        // Rust шлёт вместо XRAYDELAY SOCKS и allowTethering=false: сброс этих
-        // значений сессию не меняет.
-        expect(connectionFingerprint(xrayDelay), connectionFingerprint(socks));
-        expect(connectionFingerprint(tethering), connectionFingerprint(noTethering));
-      } else {
-        expect(connectionFingerprint(xrayDelay), isNot(connectionFingerprint(socks)));
-        expect(connectionFingerprint(tethering),
-            isNot(connectionFingerprint(noTethering)));
-      }
+      expect(connectionFingerprint(xrayDelay), isNot(connectionFingerprint(socks)));
+      expect(connectionFingerprint(tethering),
+          isNot(connectionFingerprint(noTethering)));
     });
   });
 }

@@ -67,9 +67,9 @@ void main() {
         home: Scaffold(
           body: FeatureGate(
             features: CoreFeatures.rust,
-            feature: CoreFeature.quicBlocking,
+            feature: CoreFeature.customMtu,
             onReset: () => reset = true,
-            child: const Text('QUIC blocking: on'),
+            child: const Text('MTU: 1400'),
           ),
         ),
       ),
@@ -96,23 +96,46 @@ void main() {
     ),
   );
 
-  testWidgets('Rust explains why the tethering switch does not apply', (
+  testWidgets('both cores check flow owners, so the tethering switch applies', (
+    tester,
+  ) async {
+    for (final features in [CoreFeatures.go, CoreFeatures.rust]) {
+      var changed = false;
+      await tester.pumpWidget(
+        tetheringToggle(
+          features,
+          value: false,
+          onChanged: (_) => changed = true,
+        ),
+      );
+      await tester.tap(find.byType(Switch));
+      expect(changed, isTrue);
+      expect(find.text('Сбросить неподдерживаемое значение'), findsNothing);
+    }
+  });
+
+  testWidgets('an inert Rust control explains itself and offers no reset', (
     tester,
   ) async {
     var changed = false;
-    // No stored value changes what Rust does, so there is nothing to reset.
+    // No stored ICMP value changes what Rust does, so there is nothing to reset.
     await tester.pumpWidget(
-      tetheringToggle(
-        CoreFeatures.rust,
-        value: true,
-        onChanged: (_) => changed = true,
+      MaterialApp(
+        home: Scaffold(
+          body: FeatureGate(
+            features: CoreFeatures.rust,
+            feature: CoreFeature.icmpToggle,
+            child: SwitchListTile(
+              title: const Text('ICMP (ping)'),
+              value: true,
+              onChanged: (_) => changed = true,
+            ),
+          ),
+        ),
       ),
     );
-    expect(find.text('Раздача через VPN'), findsOneWidget);
     expect(
-      find.text(
-        CoreFeatures.rust.unavailableReason(CoreFeature.tetheringControl)!,
-      ),
+      find.text(CoreFeatures.rust.unavailableReason(CoreFeature.icmpToggle)!),
       findsOneWidget,
     );
     await tester.tap(find.byType(Switch), warnIfMissed: false);
@@ -120,44 +143,33 @@ void main() {
     expect(find.text('Сбросить неподдерживаемое значение'), findsNothing);
   });
 
-  testWidgets('Go keeps the tethering switch interactive', (tester) async {
-    var changed = false;
-    await tester.pumpWidget(
-      tetheringToggle(
-        CoreFeatures.go,
-        value: false,
-        onChanged: (_) => changed = true,
-      ),
-    );
-    await tester.tap(find.byType(Switch));
-    expect(changed, isTrue);
-    expect(find.text('Сбросить неподдерживаемое значение'), findsNothing);
-  });
-
-  testWidgets('a stored XRAYDELAY probe is shown in Rust with a reset to SOCKS', (
+  testWidgets('a stored XRAYDELAY probe stays as is in both cores', (
     tester,
   ) async {
-    var probe = HeartbeatProbe.xrayDelay;
-    final feature = CoreFeatures.heartbeatProbeFeature(probe)!;
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(
-          body: FeatureGate(
-            features: CoreFeatures.rust,
-            feature: feature,
-            onReset: () => probe = HeartbeatProbe.socks,
-            child: Text(probe.name.toUpperCase()),
+    final feature = CoreFeatures.heartbeatProbeFeature(
+      HeartbeatProbe.xrayDelay,
+    )!;
+    for (final features in [CoreFeatures.go, CoreFeatures.rust]) {
+      var tapped = false;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: FeatureGate(
+              features: features,
+              feature: feature,
+              onReset: () {},
+              child: TextButton(
+                onPressed: () => tapped = true,
+                child: const Text('XRAYDELAY'),
+              ),
+            ),
           ),
         ),
-      ),
-    );
-    expect(find.text('XRAYDELAY'), findsOneWidget);
-    expect(
-      find.text(CoreFeatures.rust.unavailableReason(feature)!),
-      findsOneWidget,
-    );
-    await tester.tap(find.text('Сбросить неподдерживаемое значение'));
-    expect(probe, HeartbeatProbe.socks);
+      );
+      await tester.tap(find.text('XRAYDELAY'));
+      expect(tapped, isTrue);
+      expect(find.text('Сбросить неподдерживаемое значение'), findsNothing);
+    }
   });
 
   testWidgets('PASSIVE stays an ordinary interactive value in both cores', (

@@ -16,7 +16,6 @@ enum CoreFeature {
   upstreamUpdates,
   observatory,
   rawConfig,
-  visionWithTls,
   geoip,
   geosite,
   appRouting,
@@ -41,28 +40,29 @@ class CoreFeatures {
   static const rustDisabled = {
     CoreFeature.socksAuthentication,
     CoreFeature.proxyOnly,
-    CoreFeature.udpToggle,
     CoreFeature.icmpToggle,
-    CoreFeature.quicBlocking,
     CoreFeature.customMtu,
-    CoreFeature.fragmentation,
-    CoreFeature.noise,
     CoreFeature.mux,
     CoreFeature.upstreamUpdates,
     CoreFeature.observatory,
     CoreFeature.rawConfig,
-    CoreFeature.visionWithTls,
-    CoreFeature.coreDelayProbe,
-    CoreFeature.tetheringControl,
-    CoreFeature.outboundDelayProbe,
   };
   bool supports(CoreFeature feature) =>
       !isRust || !rustDisabled.contains(feature);
 
-  bool effectiveQuicBlock({
-    required bool requested,
-    required bool usesVision,
-  }) => requested || (supports(CoreFeature.quicBlocking) && usesVision);
+  /// Vision outbounds reject UDP/443. Go blocks QUIC for every Vision [flow];
+  /// its tun2socks answers UDP/443 with ICMP "port unreachable". The Rust core
+  /// sends that ICMP itself for plain `xtls-rprx-vision` (`blocks_udp443`), and
+  /// a blackhole rule would replace it with a silent drop, so Rust adds the rule
+  /// automatically only for `xtls-rprx-vision-udp443`, as Go blocks it.
+  /// Otherwise only the user's toggle blocks QUIC.
+  bool effectiveQuicBlock({required bool requested, required String? flow}) {
+    final vision = flow ?? '';
+    return requested ||
+        (isRust
+            ? vision == 'xtls-rprx-vision-udp443'
+            : vision.contains('vision'));
+  }
 
   /// The feature a heartbeat probe relies on; SOCKS works in both cores.
   static CoreFeature? heartbeatProbeFeature(HeartbeatProbe probe) =>
@@ -90,39 +90,33 @@ class CoreFeatures {
   String? unavailableReason(CoreFeature feature) {
     if (supports(feature)) return null;
     return switch (feature) {
-      CoreFeature.visionWithTls =>
-        'Vision поверх TLS пока недоступен: в текущем Rust-ядре обрывается передача после перехода в direct mode. Используй TCP + Reality + Vision.',
       CoreFeature.geoip ||
       CoreFeature.geosite ||
       CoreFeature.appRouting ||
       CoreFeature.directDns ||
       CoreFeature.adBlocking ||
-      CoreFeature.passiveHeartbeat => null,
+      CoreFeature.passiveHeartbeat ||
+      CoreFeature.udpToggle ||
+      CoreFeature.quicBlocking ||
+      CoreFeature.fragmentation ||
+      CoreFeature.noise ||
+      CoreFeature.coreDelayProbe ||
+      CoreFeature.tetheringControl ||
+      CoreFeature.outboundDelayProbe => null,
       CoreFeature.socksAuthentication =>
-        'Rust: локальный SOCKS работает без логина и пароля.',
+        'Rust: локальный SOCKS работает без логина и пароля — любое приложение на устройстве, в том числе исключённое, может выйти через него в VPN и узнать IP сервера.',
       CoreFeature.proxyOnly => 'Rust: доступен режим VPN через TUN.',
-      CoreFeature.udpToggle => 'Rust: UDP включён постоянно.',
       CoreFeature.icmpToggle =>
-        'Rust: ICMP обрабатывается ядром локально; настройка не применяется.',
-      CoreFeature.quicBlocking =>
-        'Блокировка QUIC пока недоступна в Rust-сборке.',
+        'Rust: ICMP обрабатывается ядром локально, а при проверке владельца потоков («ТОЛЬКО» или исключения без раздачи) отбрасывается; настройка не применяется.',
       CoreFeature.customMtu => 'Rust: используется MTU 1500.',
-      CoreFeature.fragmentation =>
-        'Фрагментация пока недоступна в Rust-сборке.',
-      CoreFeature.noise => 'Шумы пока недоступны в Rust-сборке.',
-      CoreFeature.mux => 'Mux пока недоступен в Rust-сборке.',
+      CoreFeature.mux =>
+        'Mux пока недоступен в Rust-сборке: ядро не мультиплексирует VLESS, а для xHTTP допускает только UDP-ветку.',
       CoreFeature.upstreamUpdates =>
         'Rust-сборка обновляется вручную из форка.',
       CoreFeature.observatory =>
         'Rust: управляемые JSON-конфиги и Observatory пока недоступны.',
       CoreFeature.rawConfig =>
-        'Rust: поддерживаются VLESS с TLS/Reality, включая TCP + Vision, и Hysteria2 без obfs и смены портов; полный JSON пока недоступен.',
-      CoreFeature.coreDelayProbe =>
-        'XRAYDELAY недоступен: в Rust-ядре нет встроенного замера задержки по URL, туннель проверяется SOCKS-пробой.',
-      CoreFeature.tetheringControl =>
-        'Rust-ядро не проверяет владельца потоков TUN: потоки без владельца не блокируются, и защита 1.6.4 от обхода исключений через tun0 здесь не действует.',
-      CoreFeature.outboundDelayProbe =>
-        'Rust: кандидаты проверяются TCP-пингом, а не замером через сам протокол; берутся только профили, которые поддерживает Rust-сборка.',
+        'Rust: поддерживаются VLESS, Trojan, VMess AEAD, Shadowsocks 2022 и Hysteria2 из ссылок; полный JSON пока недоступен.',
     };
   }
 }

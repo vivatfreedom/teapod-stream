@@ -143,11 +143,44 @@ void main() {
     }
   });
 
-  test('rejects Hysteria2 features xray-rust 0.7.0 does not run', () {
+  test('Salamander and port hopping use the Go builder FinalMask unchanged', () {
+    for (final (query, port) in [
+      ('obfs=salamander&obfs-password=salamander-pass', '8443'),
+      ('', '20000-30000'),
+      ('', '443,5000-6000'),
+      ('mport=20000-30000', '443'),
+      ('obfs=salamander&obfs-password=salamander-pass', '20000-30000'),
+    ]) {
+      final config = VlessParser.parseUri(
+        'hy2://s3cret@hy.example:$port/?sni=cover.example&$query',
+      )!;
+      expect(RustConfigBuilder.unsupportedReason(config), isNull, reason: query);
+      final rust = proxy(RustConfigBuilder.build(config, options()));
+      final go = proxy(XrayConfigBuilder.build(config, options()));
+      // xray-rust 0.8.1 reads Xray-core v26.7.28's spelling, which Go writes.
+      expect(
+        rust['streamSettings']['finalmask'],
+        go['streamSettings']['finalmask'],
+      );
+      expect(rust['settings']['port'], config.port);
+      final mask = rust['streamSettings']['finalmask'] as Map;
+      expect(mask.containsKey('udp'), config.obfsPassword != null);
+      expect(mask.containsKey('quicParams'), config.hopPorts != null);
+      if (config.hopPorts != null) {
+        expect(mask['quicParams'], {
+          'udpHop': {'ports': config.hopPorts},
+        });
+      }
+      expect(rust['streamSettings'].containsKey('sockopt'), isFalse);
+    }
+  });
+
+  test('rejects Hysteria2 features xray-rust 0.8.1 does not run', () {
     final cases = {
-      'obfs=salamander&obfs-password=secret': 'Salamander',
+      'obfs=salamander&obfs-password=abc': '4 до 4096',
+      'obfs=salamander': 'obfs-password',
+      'obfs=gecko&obfs-password=secret-pass': 'gecko',
       'insecure=1': 'allowInsecure',
-      'mport=20000-30000': 'port hopping',
     };
     for (final entry in cases.entries) {
       final config = hy2(entry.key);
@@ -161,48 +194,65 @@ void main() {
         throwsFormatException,
       );
     }
-    for (final uri in [
-      'hy2://s3cret@hy.example:20000-30000/?sni=cover.example',
-      'hy2://s3cret@hy.example:443,5000-6000?sni=cover.example',
-    ]) {
-      final config = VlessParser.parseUri(uri)!;
-      expect(
-        RustConfigBuilder.unsupportedReason(config),
-        allOf(contains('port hopping'), contains(config.hopPorts!)),
-      );
-    }
+    final tooManyPorts = VlessParser.parseUri(
+      'hy2://s3cret@hy.example:1-65535,1-2/?sni=cover.example',
+    )!;
+    expect(RustConfigBuilder.unsupportedReason(tooManyPorts), contains('65535'));
     final longAuth = VlessParser.parseUri(
       'hy2://${'a' * 4097}@hy.example:443',
     )!;
     expect(RustConfigBuilder.unsupportedReason(longAuth), contains('4096'));
   });
 
-  test('Mux and fragmentation do not block Hysteria2; noise does', () {
-    final config = hy2('pinSHA256=$pinHex');
+  test('Mux and fragmentation do not apply to Hysteria2; noise follows Salamander', () {
+    final config = hy2(
+      'pinSHA256=$pinHex&obfs=salamander&obfs-password=salamander-pass',
+    );
     final json = RustConfigBuilder.build(
       config,
-      options(mux: true, fragment: true),
+      options(mux: true, fragment: true, noise: true),
     );
     expect(proxy(json).containsKey('mux'), isFalse);
     expect(
       (json['outbounds'] as List).any((dynamic o) => o['tag'] == 'dialer-out'),
       isFalse,
     );
+    final stream = proxy(json)['streamSettings'] as Map;
+    expect(stream.containsKey('sockopt'), isFalse);
+    // Go sends noise through a raw freedom dialer beneath Salamander: in
+    // xray-rust's order a noise mask after Salamander stays unobfuscated.
+    expect(stream['finalmask'], {
+      'udp': [
+        {
+          'type': 'salamander',
+          'settings': {'password': 'salamander-pass'},
+        },
+        {
+          'type': 'noise',
+          'settings': {
+            'reset': 0,
+            'noise': [
+              {'rand': '50-100', 'delay': '10-20'},
+            ],
+          },
+        },
+      ],
+    });
+    // Go keeps its freedom dialer for the same options.
+    final go = XrayConfigBuilder.build(config, options(noise: true));
     expect(
-      () => RustConfigBuilder.build(config, options(noise: true)),
-      throwsFormatException,
+      (go['outbounds'] as List).any((dynamic o) => o['tag'] == 'dialer-out'),
+      isTrue,
     );
-    // VLESS keeps rejecting both.
+    // VLESS keeps rejecting Mux.
     final vless = VlessParser.parseUri(
       'vless://11111111-2222-4333-8444-555555555555@edge.example:443'
       '?type=tcp&security=tls&encryption=none&sni=cover.example',
     )!;
-    for (final opts in [options(mux: true), options(fragment: true)]) {
-      expect(
-        () => RustConfigBuilder.build(vless, opts),
-        throwsFormatException,
-      );
-    }
+    expect(
+      () => RustConfigBuilder.build(vless, options(mux: true)),
+      throwsFormatException,
+    );
   });
 
   for (final direction in [

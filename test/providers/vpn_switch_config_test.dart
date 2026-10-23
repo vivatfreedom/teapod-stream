@@ -56,7 +56,7 @@ void main() {
   final messenger =
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
 
-  test('switchConfig probes only candidates the selected core can run', () async {
+  test('switchConfig measures only candidates the selected core can run', () async {
     final calls = <MethodCall>[];
     messenger.setMockMethodCallHandler(channel, (call) async {
       calls.add(call);
@@ -89,7 +89,9 @@ void main() {
       port: 443,
       uuid: '11111111-2222-4333-8444-555555555555',
       security: VpnSecurity.tls,
-      transport: VpnTransport.tcp,
+      // VMess over the legacy QUIC carrier: Go runs it, xray-rust has no QUIC
+      // carrier and refuses the profile.
+      transport: VpnTransport.quic,
       createdAt: DateTime(2026),
     );
     final container = ProviderContainer(overrides: [
@@ -117,16 +119,34 @@ void main() {
     final probes = calls
         .where((c) => c.method == 'ping' || c.method == 'measureOutbound')
         .toList();
+    // Both builds measure candidates through the protocol, never by TCP ping.
     if (CoreFeatures.current.isRust) {
-      expect(probes.map((c) => c.method), ['ping']);
-      expect((probes.single.arguments as Map)['address'], 'vless.example');
+      expect(probes.map((c) => c.method), ['measureOutbound']);
+      final args = probes.single.arguments as Map;
+      expect(args['url'], HeartbeatTarget.cloudflare.url);
+      // The temporary core gets the candidate's probe variant: no TUN, its
+      // own loopback SOCKS on an ephemeral port, the proxy leaf only.
+      final probe = jsonDecode(args['config'] as String) as Map<String, dynamic>;
+      expect(probe['inbounds'], [
+        {
+          'tag': 'probe-in',
+          'protocol': 'socks',
+          'listen': '127.0.0.1',
+          'port': 0,
+          'settings': {'auth': 'noauth', 'udp': false},
+        },
+      ]);
+      final outbounds = probe['outbounds'] as List<dynamic>;
+      expect(outbounds.map((o) => o['tag']), ['proxy']);
+      expect(outbounds.single['settings']['vnext'][0]['address'], 'vless.example');
+      expect(probe.containsKey('routing'), isFalse);
     } else {
       expect(probes.map((c) => c.method), ['measureOutbound', 'measureOutbound']);
     }
     final log = container.read(logServiceProvider).map((e) => e.message);
-    expect(log.any((m) => m.contains('TCP-пингом')), CoreFeatures.current.isRust);
-    expect(log.any((m) => m.contains('недоступна в этой сборке')),
-        CoreFeatures.current.isRust);
+    expect(log.any((m) => m.contains('TCP-пингом')), isFalse);
+    // XRAYDELAY reaches native unchanged in both builds.
+    expect(log.any((m) => m.contains('недоступна в этой сборке')), isFalse);
     expect(container.read(configProvider).value!.activeConfigId,
         CoreFeatures.current.isRust ? 'vless' : anyOf('vless', 'vmess'));
   });

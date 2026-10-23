@@ -244,6 +244,42 @@ void main() {
       });
     });
 
+    group('Trojan outbound', () {
+      // Shared parser fix: security, REALITY keys and the pin were dropped.
+      test('follows the link security instead of always TLS', () {
+        final reality = XrayConfigBuilder.build(
+          VlessParser.parseUri(
+            'trojan://pw@1.2.3.4:443?security=reality&type=tcp&sni=cover.example'
+            '&pbk=key&sid=ab12&fp=chrome',
+          )!,
+          _defaultOptions(),
+        );
+        final stream =
+            (reality['outbounds'] as List).first['streamSettings'] as Map;
+        expect(stream['security'], 'reality');
+        expect(stream['realitySettings']['publicKey'], 'key');
+        expect(stream['realitySettings']['shortId'], 'ab12');
+        expect(stream.containsKey('tlsSettings'), isFalse);
+
+        final pinned = XrayConfigBuilder.build(
+          VlessParser.parseUri(
+            'trojan://pw@1.2.3.4:443?sni=cover.example&pinSHA256=${'ab' * 32}',
+          )!,
+          _defaultOptions(),
+        );
+        final tls = (pinned['outbounds'] as List).first['streamSettings']
+            ['tlsSettings'] as Map;
+        expect(tls['pinnedPeerCertSha256'], 'ab' * 32);
+        expect(tls['allowInsecure'], isFalse);
+        final plain = VlessParser.parseUri('trojan://pw@1.2.3.4:443')!;
+        expect(
+          (XrayConfigBuilder.build(plain, _defaultOptions())['outbounds'] as List)
+              .first['streamSettings']['security'],
+          'tls',
+        );
+      });
+    });
+
     group('Shadowsocks outbound', () {
       test('uses servers format with method and password', () {
         final config = VpnConfig(

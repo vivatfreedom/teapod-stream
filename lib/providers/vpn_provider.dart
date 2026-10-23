@@ -266,7 +266,7 @@ class VpnNotifier extends Notifier<VpnState2> {
           ref.read(configProvider).maybeWhen(data: (d) => d, orElse: () => null);
       if (configState == null) return;
       final current = _resolveEffectiveConfig(configState);
-      // Rust-сборка запускает только часть VLESS/Hysteria2-профилей: неподдерживаемый
+      // Rust-сборка запускает не все профили (см. RustConfigBuilder): неподдерживаемый
       // кандидат не подключится, даже если сервер жив. В Go фильтр пропускает всё.
       final candidates =
           _switchCandidates(configState, settings.heartbeat.switchSource, current)
@@ -277,18 +277,12 @@ class VpnNotifier extends Notifier<VpnState2> {
         return;
       }
 
-      // Rust: временного xray-инстанса для замера нет — кандидаты проверяются
-      // TCP-пингом, как в 1.6.3. Открытый порт ещё не значит рабочий протокол.
-      final measureOutbound =
-          CoreFeatures.current.supports(CoreFeature.outboundDelayProbe);
-      log.addInfo(
-          'urltest: туннель не отвечает, проверяю ${candidates.length} конфиг(ов)'
-          '${measureOutbound ? '' : ' TCP-пингом'}',
+      log.addInfo('urltest: туннель не отвечает, проверяю ${candidates.length} конфиг(ов)',
           source: 'urltest');
       // Замер идёт через временный xray-инстанс с конфигом кандидата: TCP-пинг
       // сказал бы «жив» и про сервер, у которого порт открыт, а протокол молчит.
-      // Инстанс временный, inbounds Go вырезает сам — важны только поля,
-      // влияющие на outbound.
+      // Инстанс временный: inbounds Go вырезает сам, Rust собирает отдельный
+      // probe-конфиг без TUN — важны только поля, влияющие на outbound.
       final options = VpnEngineOptions(
         socksPort: AppConstants.defaultSocksPort,
         httpPort: 0,
@@ -300,9 +294,7 @@ class VpnNotifier extends Notifier<VpnState2> {
         mux: settings.mux,
       );
       final probed = await Future.wait(candidates.map((c) async {
-        final ms = measureOutbound
-            ? await _engine.measureOutbound(c, options, settings.heartbeat.url)
-            : await _engine.pingConfig(c);
+        final ms = await _engine.measureOutbound(c, options, settings.heartbeat.url);
         return (config: c, latency: ms);
       }));
       final alive = probed.where((r) => r.latency != null).toList()
@@ -532,10 +524,11 @@ class VpnNotifier extends Notifier<VpnState2> {
       sniffingEnabled: settings.sniffingEnabled,
       mtu: settings.mtu,
       dnsQueryStrategy: settings.dnsQueryStrategy,
-      // Go's TUN bridge can reject QUIC immediately for Vision. Rust handles
-      // Vision's UDP policy internally and has no host-side QUIC toggle.
+      // Vision rejects UDP/443. Go's tun2socks answers it with ICMP for every
+      // Vision flow; the Rust core does that itself for plain Vision, so Rust
+      // adds its blackhole rule only for -udp443 or on the toggle.
       blockQuic: CoreFeatures.current.effectiveQuicBlock(
-        requested: settings.blockQuic, usesVision: _usesVisionFlow(config)),
+        requested: settings.blockQuic, flow: _visionFlow(config)),
       ipv6Enabled: settings.ipv6Enabled,
       allowTethering: settings.allowTethering,
       obsProbeIntervalSec: settings.obsProbeIntervalSec,
@@ -653,12 +646,13 @@ class VpnNotifier extends Notifier<VpnState2> {
   VpnConfig? _resolveEffectiveConfig(ConfigState? cs) =>
       cs == null ? null : ref.read(effectiveConfigProvider);
 
-  /// True when the config's outbound(s) use xtls-rprx-vision — such outbounds
-  /// reject UDP/443, so QUIC must be fast-failed on the TUN side.
-  static bool _usesVisionFlow(VpnConfig config) {
-    if (config.flow?.contains('vision') ?? false) return true;
+  /// The xtls-rprx-vision flow of the config's outbound(s), or null — such
+  /// outbounds reject UDP/443, so QUIC must be fast-failed on the TUN side.
+  static String? _visionFlow(VpnConfig config) {
+    final flow = config.flow;
+    if (flow != null && flow.contains('vision')) return flow;
     final raw = config.rawXrayConfig;
-    if (raw == null) return false;
+    if (raw == null) return null;
     try {
       final cfg = jsonDecode(raw) as Map<String, dynamic>;
       final outbounds = cfg['outbounds'] as List<dynamic>? ?? [];
@@ -668,12 +662,13 @@ class VpnNotifier extends Notifier<VpnState2> {
         for (final v in vnext.whereType<Map<String, dynamic>>()) {
           final users = v['users'] as List<dynamic>? ?? [];
           for (final u in users.whereType<Map<String, dynamic>>()) {
-            if ((u['flow'] as String?)?.contains('vision') ?? false) return true;
+            final userFlow = u['flow'] as String?;
+            if (userFlow != null && userFlow.contains('vision')) return userFlow;
           }
         }
       }
     } catch (_) {}
-    return false;
+    return null;
   }
 
   Future<void> pingAllConfigs() async {
