@@ -161,7 +161,9 @@ class VlessParser {
 
       final atIdx = main.lastIndexOf('@');
       if (atIdx < 0) return null;
-      final password = main.substring(0, atIdx);
+      // Пароль в ссылке percent-кодирован (схема trojan-gfw, v2rayN/v2rayNG
+      // декодируют его); битый % оставляет строку как есть.
+      final password = _decodeComponentOrRaw(main.substring(0, atIdx));
       final hostPart = main.substring(atIdx + 1);
 
       final qIdx = hostPart.indexOf('?');
@@ -170,6 +172,15 @@ class VlessParser {
 
       final (host, port) = _parseHostPort(hostPort, 443);
       final params = Uri.splitQueryString(queryStr);
+      // Trojan по умолчанию TLS, но ссылка может задать reality или none —
+      // раньше они молча превращались в TLS, а pbk/sid, pinSHA256, alpn и ech
+      // терялись. allowInsecure по-прежнему не читается: без пина сертификат
+      // проверяется, как и раньше.
+      final security = switch (params['security']?.trim().toLowerCase()) {
+        'reality' => VpnSecurity.reality,
+        'none' => VpnSecurity.none,
+        _ => VpnSecurity.tls,
+      };
 
       return VpnConfig(
         id: const Uuid().v4(),
@@ -179,15 +190,22 @@ class VlessParser {
         port: port,
         uuid: '',
         password: password,
-        security: VpnSecurity.tls,
+        security: security,
         transport: _parseTransport(params['type'] ?? 'tcp'),
+        pinSHA256: params['pinSHA256'],
         sni: params['sni'] ?? params['peer'],
         wsPath: params['path'],
         wsHost: params['host'],
         fingerprint: params['fp'],
+        publicKey: params['pbk'],
+        shortId: params['sid'],
+        spiderX: params['spx'],
+        postQuantumKey: params['pqv'],
         grpcServiceName: params['serviceName'],
         xhttpMode: params['mode'],
         xhttpExtra: _parseExtra(params['extra']),
+        alpn: params['alpn'],
+        ech: params['ech'],
         createdAt: DateTime.now(),
         rawUri: uri,
       );
@@ -225,11 +243,15 @@ class VlessParser {
             : hostPortRaw;
         if (qIdx >= 0) queryStr = hostPart.substring(qIdx + 1);
 
+        // SIP002: userinfo — base64url(method:password) или, для SS2022,
+        // percent-encoded `method:password`. Раньше %2B/%3D/%3A ключа
+        // оставались в пароле как есть.
+        final plainUserInfo = _decodeComponentOrRaw(userInfo);
         String decoded;
         try {
-          decoded = utf8.decode(base64Decode(_padBase64(userInfo)));
+          decoded = utf8.decode(base64Decode(_padBase64(plainUserInfo)));
         } catch (_) {
-          decoded = userInfo;
+          decoded = plainUserInfo;
         }
 
         final colonIdx = decoded.indexOf(':');
@@ -363,6 +385,14 @@ class VlessParser {
       );
     } catch (e) {
       return null;
+    }
+  }
+
+  static String _decodeComponentOrRaw(String value) {
+    try {
+      return Uri.decodeComponent(value);
+    } catch (_) {
+      return value;
     }
   }
 

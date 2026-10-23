@@ -83,6 +83,54 @@ void main() {
       test('missing @ returns null', () {
         expect(VlessParser.parseUri('trojan://no-at-server:443'), isNull);
       });
+
+      test('percent-decodes the password, as share links encode it', () {
+        expect(
+          VlessParser.parseUri('trojan://p%40ss%3A1@server.com:443?security=tls')!
+              .password,
+          'p@ss:1',
+        );
+        // A raw "@" still parses (the last "@" ends the password); a stray
+        // "%" leaves the password as given.
+        expect(
+          VlessParser.parseUri('trojan://p@ss@server.com:443')!.password,
+          'p@ss',
+        );
+        expect(
+          VlessParser.parseUri('trojan://100%zz@server.com:443')!.password,
+          '100%zz',
+        );
+      });
+
+      test('security defaults to TLS and keeps reality or none', () {
+        for (final (query, security) in [
+          ('', VpnSecurity.tls),
+          ('security=tls', VpnSecurity.tls),
+          ('security=xtls', VpnSecurity.tls),
+          ('security=reality', VpnSecurity.reality),
+          ('security=REALITY', VpnSecurity.reality),
+          ('security=none', VpnSecurity.none),
+        ]) {
+          final config = VlessParser.parseUri('trojan://pw@server.com:443?$query');
+          expect(config!.security, security, reason: query);
+        }
+      });
+
+      test('keeps REALITY keys, pin, ALPN and ECH; allowInsecure is not read', () {
+        final config = VlessParser.parseUri(
+          'trojan://pw@server.com:443?security=reality&type=grpc&pbk=key&sid=ab12'
+          '&spx=%2Fprobe&pqv=pq&pinSHA256=00ff&alpn=h2%2Chttp%2F1.1&ech=AEX%2B'
+          '&allowInsecure=1&sni=cover.example',
+        )!;
+        expect(config.publicKey, 'key');
+        expect(config.shortId, 'ab12');
+        expect(config.spiderX, '/probe');
+        expect(config.postQuantumKey, 'pq');
+        expect(config.pinSHA256, '00ff');
+        expect(config.alpn, 'h2,http/1.1');
+        expect(config.ech, 'AEX+');
+        expect(config.allowInsecure, isFalse);
+      });
     });
 
     group('Shadowsocks', () {
@@ -95,6 +143,25 @@ void main() {
         expect(config.method, 'chacha20-ietf-poly1305');
         expect(config.password, 'mypassword');
         expect(config.port, 8388);
+      });
+
+      test('percent-encoded SIP002 userinfo is decoded', () {
+        const key = 'YctPZ6U7xPPcU+gp3u+0tx/tRizJN9K8y+uKlW2qjlI=';
+        for (final link in [
+          'ss://2022-blake3-aes-256-gcm:${Uri.encodeComponent(key)}@1.2.3.4:8388#SS',
+          'ss://${Uri.encodeComponent('2022-blake3-aes-256-gcm:$key')}@1.2.3.4:8388/?#SS',
+          // base64 userinfo whose padding was percent-encoded
+          'ss://${base64Encode(utf8.encode('aes-256-gcm:pass')).replaceAll('=', '%3D')}@1.2.3.4:8388',
+        ]) {
+          final config = VlessParser.parseUri(link)!;
+          expect(config.port, 8388, reason: link);
+          if (config.method == 'aes-256-gcm') {
+            expect(config.password, 'pass');
+          } else {
+            expect(config.method, '2022-blake3-aes-256-gcm');
+            expect(config.password, key);
+          }
+        }
       });
     });
 
